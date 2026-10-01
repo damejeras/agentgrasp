@@ -379,10 +379,11 @@ mod tests {
             evaluator: &evaluator,
             tokens: 10,
         };
-        admission.back_off(Duration::from_millis(500));
+        // Taken before the cooldown starts, so a pause can only make the wait look longer.
         let started = Instant::now();
+        admission.back_off(Duration::from_millis(500));
         admission.admit().await.unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(450));
+        assert!(started.elapsed() >= Duration::from_millis(500));
     }
 
     #[tokio::test]
@@ -397,19 +398,15 @@ mod tests {
             state: serde_json::json!({}),
             questions: questions(1),
         };
+        let before = Instant::now();
         assert!(evaluator.evaluate(&request, false).await.is_err());
-        let started = Instant::now();
-        Admission {
-            evaluator: &evaluator,
-            tokens: 10,
-        }
-        .admit()
-        .await
-        .unwrap();
+        // The first 429 cools down 0.6 s and the retry waits that long; the final 429 then
+        // cools down 0.6 s more.
+        let cooldown = *evaluator.cooldown.lock().unwrap();
         assert!(
-            started.elapsed() >= Duration::from_millis(400),
+            cooldown >= before + Duration::from_millis(1200),
             "{:?}",
-            started.elapsed()
+            cooldown - before
         );
     }
 
@@ -438,33 +435,42 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_key_stops_waiting_attempts() {
-        let server = support::FakeJev::start(|_, _| {
-            support::Reply::status(401, "{}").delayed(Duration::from_millis(100))
-        })
-        .await;
+        let gate = support::Gate::default();
+        let held = gate.clone();
+        let server =
+            support::FakeJev::start(move |_, _| support::Reply::status(401, "{}").held(&held))
+                .await;
         let evaluator =
             Evaluator::new(jev::Client::new(&server.url, "k"), CancellationToken::new());
         let request = Request {
             state: serde_json::json!({}),
             questions: questions(1),
         };
-        let waiting = Admission {
-            evaluator: &evaluator,
-            tokens: TOKENS_PER_SECOND,
-        };
-        let started = Instant::now();
-        let (first, second) = tokio::join!(evaluator.evaluate(&request, false), async {
-            // Let the first attempt take its share of the budget, so this one waits.
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            waiting.admit().await
-        });
+        let (first, second) = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::join!(evaluator.evaluate(&request, false), async {
+                server.received(1).await;
+                // An hour of cooldown: this admission can only end through the rejection.
+                let waiting = Admission {
+                    evaluator: &evaluator,
+                    tokens: 10,
+                };
+                waiting.back_off(Duration::from_secs(3600));
+                let admit = waiting.admit();
+                tokio::pin!(admit);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), &mut admit)
+                        .await
+                        .is_err(),
+                    "it waits"
+                );
+                gate.open();
+                admit.await
+            })
+        })
+        .await
+        .expect("a stall guard: the calls end long before this");
         assert!(matches!(first, Err(EvalError::Unauthorized)));
         assert!(matches!(second, Err(Failure::Unauthorized)));
-        assert!(
-            started.elapsed() < Duration::from_millis(700),
-            "{:?}",
-            started.elapsed()
-        );
         assert_eq!(server.requests(), 1);
         assert_eq!(
             evaluator.requests.load(Ordering::SeqCst),
@@ -475,14 +481,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_key_ends_a_retry_wait() {
-        let server = support::FakeJev::start(|_, request| {
-            let question = request["questions"]["q0"]["instructions"]
-                .as_str()
-                .unwrap_or("");
-            if question == "slow?" {
+        let gate = support::Gate::default();
+        let held = gate.clone();
+        let server = support::FakeJev::start(move |_, request| {
+            if request["questions"]["q0"]["instructions"] == "slow?" {
                 support::Reply::status(429, "{}").header("retry-after", "3600")
             } else {
-                support::Reply::status(401, "{}").delayed(Duration::from_millis(200))
+                support::Reply::status(401, "{}").held(&held)
             }
         })
         .await;
@@ -496,21 +501,34 @@ mod tests {
             }],
         };
         let (slow, fast) = (ask("slow?"), ask("fast?"));
-        let started = Instant::now();
-        let (waiting, rejected) = tokio::join!(
-            evaluator.evaluate(&slow, false),
-            evaluator.evaluate(&fast, false)
-        );
+        let (rejected, waiting) = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::join!(evaluator.evaluate(&fast, false), async {
+                // The rejected call is sent first and held, so the slow call is admitted before
+                // the 429's hour of cooldown would stop it.
+                server.received(1).await;
+                let call = evaluator.evaluate(&slow, false);
+                tokio::pin!(call);
+                // The 429 moves the shared cooldown an hour ahead just before the retry wait.
+                while *evaluator.cooldown.lock().unwrap()
+                    < Instant::now() + Duration::from_secs(1800)
+                {
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(5), &mut call)
+                            .await
+                            .is_err()
+                    );
+                }
+                gate.open();
+                call.await
+            })
+        })
+        .await
+        .expect("a stall guard: the calls end long before this");
         assert!(
             matches!(waiting, Err(EvalError::Unauthorized)),
             "{waiting:?}"
         );
         assert!(matches!(rejected, Err(EvalError::Unauthorized)));
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
-        );
         assert_eq!(server.requests(), 2, "the 429 was not retried");
     }
 

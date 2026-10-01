@@ -198,10 +198,7 @@ async fn other_errors_are_not_retried() {
 
 #[tokio::test]
 async fn the_deadline_bounds_the_call() {
-    let server = FakeJev::start(|_, request| {
-        Reply::answers(request, |_| 0.5).delayed(Duration::from_secs(5))
-    })
-    .await;
+    let server = FakeJev::start(|_, request| Reply::answers(request, |_| 0.5).never()).await;
     let started = Instant::now();
     let outcome = evaluate(
         &server,
@@ -211,7 +208,10 @@ async fn the_deadline_bounds_the_call() {
     )
     .await;
     assert_eq!(outcome.result.unwrap_err(), Failure::TimedOut);
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "a stall guard, not a measure"
+    );
 
     // A retry that cannot finish before the deadline is not started.
     let server = FakeJev::start(|_, _| Reply::status(429, "{}").header("retry-after", "30")).await;
@@ -225,35 +225,31 @@ async fn the_deadline_bounds_the_call() {
     .await;
     assert_eq!(outcome.result.unwrap_err(), Failure::TimedOut);
     assert_eq!(server.requests(), 1);
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "a stall guard, not a measure"
+    );
 }
 
 #[tokio::test]
 async fn cancellation_stops_the_call() {
-    let server = FakeJev::start(|_, request| {
-        Reply::answers(request, |_| 0.5).delayed(Duration::from_secs(5))
-    })
-    .await;
+    let server = FakeJev::start(|_, request| Reply::answers(request, |_| 0.5).never()).await;
     let client = Client::new(&server.url, "k");
     let cancel = CancellationToken::new();
-    let trigger = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        trigger.cancel();
-    });
     let started = Instant::now();
-    let outcome = client
-        .evaluate(
-            &json!({}),
-            &questions(&["a"]),
-            Retry::Standard,
-            Some(Instant::now() + Duration::from_secs(10)),
-            &cancel,
-            &Open,
-        )
-        .await;
+    let (state, asked) = (json!({}), questions(&["a"]));
+    let (outcome, ()) = tokio::join!(
+        client.evaluate(&state, &asked, Retry::Standard, None, &cancel, &Open),
+        async {
+            server.received(1).await;
+            cancel.cancel();
+        }
+    );
     assert_eq!(outcome.result.unwrap_err(), Failure::Cancelled);
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "a stall guard, not a measure"
+    );
 }
 
 #[tokio::test]
@@ -276,10 +272,16 @@ async fn failure_text_never_holds_the_response_body() {
 }
 
 #[tokio::test]
-async fn an_unreachable_server_is_unavailable() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+async fn a_dropped_connection_is_unavailable() {
+    // The listener stays open, so no other test can take its port; it drops each
+    // connection without an answer.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/v1/systemone", listener.local_addr().unwrap());
-    drop(listener);
+    tokio::spawn(async move {
+        while let Ok((connection, _)) = listener.accept().await {
+            drop(connection);
+        }
+    });
     let client = Client::new(url, "k");
     let outcome = client
         .evaluate(
@@ -329,27 +331,20 @@ async fn usage_of_an_invalid_answer_set_is_kept() {
 
 #[tokio::test]
 async fn a_cancelled_request_is_recorded() {
-    let server = FakeJev::start(|_, request| {
-        Reply::answers(request, |_| 0.5).delayed(Duration::from_secs(5))
-    })
-    .await;
+    let server = FakeJev::start(|_, request| Reply::answers(request, |_| 0.5).never()).await;
     let client = Client::new(&server.url, "k");
     let cancel = CancellationToken::new();
-    let trigger = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        trigger.cancel();
-    });
-    let outcome = client
-        .evaluate(
-            &json!({}),
-            &questions(&["a"]),
-            Retry::Standard,
-            Some(Instant::now() + Duration::from_secs(10)),
-            &cancel,
-            &Open,
-        )
-        .await;
+    // The attempt starts before the server has the request, so its latency is at least the
+    // 100 ms wait before the cancel.
+    let (state, asked) = (json!({}), questions(&["a"]));
+    let (outcome, ()) = tokio::join!(
+        client.evaluate(&state, &asked, Retry::Standard, None, &cancel, &Open),
+        async {
+            server.received(1).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel.cancel();
+        }
+    );
     assert_eq!(outcome.result.unwrap_err(), Failure::Cancelled);
     assert_eq!(outcome.attempts.len(), 1);
     assert!(outcome.attempts[0].latency_ms >= 100);

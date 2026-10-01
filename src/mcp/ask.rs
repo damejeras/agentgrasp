@@ -423,14 +423,9 @@ fn read_file(
         if seen.contains(&identity) {
             return Ok(None);
         }
-        let mut bytes = Vec::new();
-        (&mut file)
-            .take(limit + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| ReadError::Unreadable)?;
-        if bytes.len() as u64 > limit {
-            return Err(ReadError::TooLarge);
-        }
+        let bytes = read_limited(&mut file, limit)
+            .map_err(|_| ReadError::Unreadable)?
+            .ok_or(ReadError::TooLarge)?;
         let after = file.metadata().map_err(|_| ReadError::Unreadable)?;
         let unchanged = |m: &std::fs::Metadata| {
             (
@@ -449,6 +444,14 @@ fn read_file(
     Err(ReadError::Changed)
 }
 
+/// At most `limit` bytes of `reader`; `None` when it holds more. The limit holds on the bytes
+/// read, so a file that grows after its size was taken cannot pass it.
+fn read_limited(reader: impl Read, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    reader.take(limit + 1).read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= limit).then_some(bytes))
+}
+
 fn write_record(state_root: &Path, record: &serde_json::Value) -> anyhow::Result<PathBuf> {
     let dir = state::allocate(state_root, Kind::Ask, &std::process::id().to_string())?;
     let path = dir.join("record.json");
@@ -461,39 +464,29 @@ fn write_record(state_root: &Path, record: &serde_json::Value) -> anyhow::Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
-    fn a_file_that_grows_during_the_read_never_passes_the_limit() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("growing.log");
-        std::fs::write(&path, vec![b'a'; 200 * 1024]).unwrap();
-        let writer_path = path.clone();
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stopped = stop.clone();
-        let writer = std::thread::spawn(move || {
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(writer_path)
-                .unwrap();
-            while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
-                file.write_all(&[b'b'; 4096]).unwrap();
-            }
-        });
-        for _ in 0..20 {
-            match read_file(&path, MAX_INPUT_BYTES, &mut HashSet::new()) {
-                Ok(None) => panic!("nothing was seen"),
-                Ok(Some(read)) => assert!(read.bytes.len() as u64 <= MAX_INPUT_BYTES),
-                Err(ReadError::TooLarge | ReadError::Changed) => {}
-                Err(ReadError::Unreadable) => panic!("the file is readable"),
-            }
-        }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        writer.join().unwrap();
-        assert!(matches!(
-            read_file(&path, MAX_INPUT_BYTES, &mut HashSet::new()),
-            Err(ReadError::TooLarge)
-        ));
+    fn the_limit_holds_on_the_bytes_read_not_on_the_size() {
+        // An endless reader stands for a file that keeps growing during the read.
+        assert!(
+            read_limited(std::io::repeat(b'x'), MAX_INPUT_BYTES)
+                .unwrap()
+                .is_none()
+        );
+        let exact = vec![b'x'; MAX_INPUT_BYTES as usize];
+        assert_eq!(
+            read_limited(exact.as_slice(), MAX_INPUT_BYTES)
+                .unwrap()
+                .unwrap()
+                .len(),
+            exact.len()
+        );
+        let over = vec![b'x'; MAX_INPUT_BYTES as usize + 1];
+        assert!(
+            read_limited(over.as_slice(), MAX_INPUT_BYTES)
+                .unwrap()
+                .is_none()
+        );
     }
 
     // A /proc file reports size 0 but has content, so every read looks changed.

@@ -31,6 +31,8 @@ struct Call {
     shown: String,
     status: i32,
     capture: Option<PathBuf>,
+    /// The hook's reason when it did not rewrite the call.
+    hook_stderr: String,
 }
 
 impl Session {
@@ -48,7 +50,7 @@ impl Session {
         }
     }
 
-    fn rewrite(&self, command: &str, id: &str) -> Option<String> {
+    fn rewrite(&self, command: &str, id: &str) -> (Option<String>, String) {
         let input = json!({
             "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": id,
             "cwd": self.cwd, "tool_input": {"command": command, "description": "test"},
@@ -73,24 +75,22 @@ impl Session {
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success(), "the hook always exits 0");
         let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if stdout.trim().is_empty() {
-            return None;
+            return (None, stderr);
         }
         let value: Value = serde_json::from_str(&stdout).unwrap();
-        Some(
-            value["hookSpecificOutput"]["updatedInput"]["command"]
-                .as_str()
-                .unwrap()
-                .to_string(),
-        )
+        let command = value["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        (Some(command.to_string()), stderr)
     }
 
     fn call(&mut self, command: &str) -> Call {
         self.calls += 1;
         let id = format!("toolu_{}", self.calls);
-        let rewritten = self
-            .rewrite(command, &id)
-            .unwrap_or_else(|| command.to_string());
+        let (rewritten, hook_stderr) = self.rewrite(command, &id);
+        let rewritten = rewritten.unwrap_or_else(|| command.to_string());
         let quoted = format!("'{}'", rewritten.replace('\'', r"'\''"));
         let script = format!(
             "eval {quoted} < /dev/null && pwd -P >| '{}'",
@@ -116,6 +116,7 @@ impl Session {
             shown: String::from_utf8_lossy(&output.stdout).into_owned(),
             status: output.status.code().unwrap_or(-1),
             capture,
+            hook_stderr,
         }
     }
 }
@@ -130,9 +131,24 @@ fn shells() -> Vec<PathBuf> {
     found
 }
 
+/// The capture directory of a call that must have been rewritten.
+fn dir(call: &Call) -> PathBuf {
+    call.capture.clone().unwrap_or_else(|| {
+        panic!(
+            "the call was not rewritten; the hook said: {}",
+            call.hook_stderr
+        )
+    })
+}
+
 /// The capture line, then what finish printed.
 fn after_capture_line(call: &Call) -> &str {
-    let dir = call.capture.as_ref().expect("the call was rewritten");
+    let dir = call.capture.as_ref().unwrap_or_else(|| {
+        panic!(
+            "the call was not rewritten; the hook said: {}",
+            call.hook_stderr
+        )
+    });
     let line = format!("agentgrasp: {}\n", dir.display());
     call.shown
         .strip_prefix(&line)
@@ -145,7 +161,7 @@ fn logs_hold_the_exact_bytes_of_each_stream() {
         let mut session = Session::new(shell.clone());
         let call = session.call("printf '\\033[31mred\\033[0m\\n'; printf 'err' >&2");
         assert_eq!(call.status, 0, "{shell:?}");
-        let dir = call.capture.clone().unwrap();
+        let dir = dir(&call);
         assert_eq!(
             std::fs::read(dir.join("stdout.log")).unwrap(),
             b"\x1b[31mred\x1b[0m\n"
@@ -176,7 +192,7 @@ fn long_output_is_summarized() {
         );
         assert!(shown.ends_with("output not shown; ask yes/no questions with the agentgrasp ask tool, or read the files\n"));
         assert!(!shown.contains("line 299"));
-        let saved = std::fs::read_to_string(call.capture.unwrap().join("stdout.log")).unwrap();
+        let saved = std::fs::read_to_string(dir(&call).join("stdout.log")).unwrap();
         assert!(saved.starts_with("line 0 of output\n") && saved.ends_with("line 299 of output\n"));
     }
 }
@@ -188,7 +204,7 @@ fn a_failing_command_fails_with_its_status() {
         let call = session.call("echo before; (exit 3)");
         assert_eq!(call.status, 3, "{shell:?}: Claude Code sees the failure");
         assert!(after_capture_line(&call).starts_with("before\nexit_code: 3\n"));
-        assert_eq!(metadata(&call.capture.unwrap())["exit_code"], 3);
+        assert_eq!(metadata(&dir(&call))["exit_code"], 3);
     }
 }
 
@@ -260,7 +276,7 @@ fn exit_and_exec_skip_finish_but_name_the_capture() {
             let mut session = Session::new(shell.clone());
             let call = session.call(command);
             assert_ne!(call.status, 0, "{shell:?} {command}");
-            let dir = call.capture.clone().expect("the capture directory exists");
+            let dir = dir(&call);
             assert_eq!(
                 call.shown,
                 format!("agentgrasp: {}\n", dir.display()),
@@ -274,7 +290,7 @@ fn exit_and_exec_skip_finish_but_name_the_capture() {
         let mut session = Session::new(shell.clone());
         let call = session.call("echo partial; exit 3");
         assert_eq!(
-            std::fs::read(call.capture.unwrap().join("stdout.log")).unwrap(),
+            std::fs::read(dir(&call).join("stdout.log")).unwrap(),
             b"partial\n"
         );
     }

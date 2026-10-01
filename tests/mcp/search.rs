@@ -653,10 +653,7 @@ async fn search_missing_key_fails_at_start() {
 async fn search_cancellation_is_interrupted() {
     let world = World::new();
     payments(&world);
-    let jev = FakeJev::start(|_, request| {
-        navigation(request, payments_score).delayed(Duration::from_secs(30))
-    })
-    .await;
+    let jev = FakeJev::start(|_, request| navigation(request, payments_score).never()).await;
     let mut client = world.default_server(&jev).await;
     client
         .send(json!({"jsonrpc": "2.0", "id": 77, "method": "tools/call",
@@ -675,8 +672,12 @@ async fn search_cancellation_is_interrupted() {
             .ok()
             .and_then(|mut dirs| dirs.next())
             .map(|d| d.unwrap().path().join("report.json"));
-        if let Some(text) = found.and_then(|path| std::fs::read_to_string(path).ok()) {
-            break serde_json::from_str::<Value>(&text).unwrap();
+        // The record is created before it is written: wait until it parses.
+        let parsed = found
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        if let Some(record) = parsed {
+            break record;
         }
         assert!(
             started.elapsed() < Duration::from_secs(10),

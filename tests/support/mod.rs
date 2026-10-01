@@ -16,6 +16,29 @@ pub struct Reply {
     pub body: String,
     pub delay: Duration,
     pub headers: Vec<(String, String)>,
+    /// The reply is sent only once this gate opens.
+    pub gate: Option<Gate>,
+}
+
+/// Holds replies until the test opens it, so a test can order events without timing.
+#[derive(Clone, Default)]
+pub struct Gate(Arc<tokio::sync::Notify>, Arc<std::sync::atomic::AtomicBool>);
+
+impl Gate {
+    pub fn open(&self) {
+        self.1.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.0.notify_waiters();
+    }
+
+    async fn passed(&self) {
+        loop {
+            let notified = self.0.notified();
+            if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl Reply {
@@ -25,6 +48,7 @@ impl Reply {
             body: body.into(),
             delay: Duration::ZERO,
             headers: Vec::new(),
+            gate: None,
         }
     }
 
@@ -53,6 +77,17 @@ impl Reply {
     pub fn delayed(mut self, delay: Duration) -> Reply {
         self.delay = delay;
         self
+    }
+
+    /// The reply waits for `gate`.
+    pub fn held(mut self, gate: &Gate) -> Reply {
+        self.gate = Some(gate.clone());
+        self
+    }
+
+    /// A reply that never comes in a test's lifetime.
+    pub fn never(self) -> Reply {
+        self.delayed(Duration::from_secs(3600))
     }
 
     pub fn header(mut self, name: &str, value: &str) -> Reply {
@@ -103,6 +138,9 @@ impl FakeJev {
                         log.len() - 1
                     };
                     let reply = handler(index, &body);
+                    if let Some(gate) = &reply.gate {
+                        gate.passed().await;
+                    }
                     tokio::time::sleep(reply.delay).await;
                     let mut head = format!(
                         "HTTP/1.1 {} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
@@ -120,6 +158,18 @@ impl FakeJev {
             }
         });
         FakeJev { url, seen }
+    }
+
+    /// Waits until the server has received `count` requests.
+    pub async fn received(&self, count: usize) {
+        let started = std::time::Instant::now();
+        while self.requests() < count {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "the server got no request"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     pub fn requests(&self) -> usize {

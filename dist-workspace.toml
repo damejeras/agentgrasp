@@ -9,8 +9,9 @@ cargo-dist-version = "0.32.0"
 ci = "github"
 # The installers to generate for each app
 installers = ["shell", "npm"]
-# Publish the npm package (the crate's name, agentgrasp) with the release
-publish-jobs = ["npm"]
+# Stage the npm package (the crate's name, agentgrasp) with the release; a maintainer
+# approves it on npmjs.com with 2FA. See .github/workflows/stage-npm.yml.
+publish-jobs = ["./stage-npm"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # Path that installers should place binaries in

@@ -207,7 +207,7 @@ pub fn finish(dir: &Path, status: &str) -> (Vec<u8>, i32) {
         let _ = writeln!(shown, "duration_seconds: {duration}");
     }
     if !in_full {
-        shown.extend_from_slice(b"output not shown; ask yes/no questions with the agentgrasp ask tool, or read the files\n");
+        shown.extend_from_slice(b"output not shown; ask yes/no questions with the agentgrasp ask tool, or open the files with the Read tool, because Bash captures their output again\n");
     }
     (shown, code)
 }

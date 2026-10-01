@@ -190,7 +190,7 @@ fn long_output_is_summarized() {
             shown.starts_with("exit_code: 0\nstdout: "),
             "{shell:?}: {shown}"
         );
-        assert!(shown.ends_with("output not shown; ask yes/no questions with the agentgrasp ask tool, or read the files\n"));
+        assert!(shown.ends_with("output not shown; ask yes/no questions with the agentgrasp ask tool, or open the files with the Read tool, because Bash captures their output again\n"));
         assert!(!shown.contains("line 299"));
         let saved = std::fs::read_to_string(dir(&call).join("stdout.log")).unwrap();
         assert!(saved.starts_with("line 0 of output\n") && saved.ends_with("line 299 of output\n"));

@@ -85,7 +85,7 @@ pub struct Output {
     pub question: String,
     pub scope: String,
     pub status: Status,
-    /// The model that Jev reports it used; null when no request succeeded.
+    /// The model that Jev reports it used; null when no response named one.
     pub model: Option<String>,
     /// Qualifying files, most relevant first, at most `limit`.
     pub matches: Vec<Match>,
@@ -134,12 +134,48 @@ pub async fn call(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    // An invalid call also gets a report: its path is null only when the report cannot be
+    // written.
     let invalid = |message: String| {
-        Output::start_failure(
+        let mut output = Output::start_failure(
             raw_question.clone(),
             raw_scope.clone(),
             ToolError::new(Code::InvalidInput, message),
-        )
+        );
+        let strings = |key: &str| -> Vec<String> {
+            arguments
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let given = Input {
+            question: raw_question.clone(),
+            scope: raw_scope.clone(),
+            include: strings("include"),
+            exclude: strings("exclude"),
+            limit: arguments.get("limit").and_then(|v| v.as_u64()),
+        };
+        let limit = given.limit.unwrap_or(DEFAULT_LIMIT);
+        let report = report(
+            &given,
+            Path::new(&raw_scope),
+            limit,
+            &output,
+            None,
+            &[],
+            SystemTime::now(),
+            Instant::now(),
+        );
+        match write_report(&config.state_root, &report) {
+            Ok(path) => output.report_path = Some(path.to_string_lossy().into_owned()),
+            Err(error) => eprintln!("agentgrasp mcp: search report not written: {error:#}"),
+        }
+        output
     };
     let input: Input = match serde_json::from_value(arguments.clone().into()) {
         Ok(input) => input,

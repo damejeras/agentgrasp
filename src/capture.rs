@@ -198,7 +198,10 @@ fn pre_tool_use(input: &Value, env: &Env) -> Result<Option<Value>> {
         kind,
         &rewrite(command, binary, "/syntax/check"),
     ) {
-        return Ok(None);
+        bail!(
+            "the rewritten command fails the syntax check of {}; the call runs unchanged",
+            shell_path.display()
+        );
     }
     let dir = state::allocate(&env.state_root, Kind::Capture, tool_use_id)?;
     let metadata = json!({
@@ -535,12 +538,16 @@ mod tests {
         background["tool_input"]["run_in_background"] = json!(true);
         let mut other_tool = pre("x");
         other_tool["tool_name"] = json!("Read");
-        for input in [background, other_tool, pre("cat <<EOF\nno end")] {
+        for input in [background, other_tool] {
             assert!(
                 hook(input.to_string().as_bytes(), &env).unwrap().is_none(),
                 "{input}"
             );
         }
+        // A failed syntax check is an error: its reason goes to stderr, and the call runs
+        // unchanged.
+        let unclosed = pre("cat <<EOF\nno end");
+        assert!(hook(unclosed.to_string().as_bytes(), &env).is_err());
         assert!(
             !temp.path().join("captures").exists()
                 || std::fs::read_dir(temp.path().join("captures"))
@@ -551,17 +558,10 @@ mod tests {
         );
         if let Some(zsh) = find_program("zsh") {
             env.shell = Some(zsh.to_string_lossy().into_owned());
-            assert!(
-                hook(pre("cat <<EOF\nno end").to_string().as_bytes(), &env)
-                    .unwrap()
-                    .is_none(),
-                "zsh"
-            );
+            assert!(hook(unclosed.to_string().as_bytes(), &env).is_err(), "zsh");
             let hidden = "for x (a b) print $x\ncat <<EOF\nno end";
             assert!(
-                hook(pre(hidden).to_string().as_bytes(), &env)
-                    .unwrap()
-                    .is_none(),
+                hook(pre(hidden).to_string().as_bytes(), &env).is_err(),
                 "zsh syntax that bash cannot parse passes through"
             );
             assert!(
@@ -638,6 +638,25 @@ mod tests {
             "{shown}"
         );
         assert_eq!(std::fs::read(dir.join("output.log")).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn output_of_2048_bytes_is_shown_and_2049_is_not() {
+        for (size, shown) in [(2048, true), (2049, false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = capture(temp.path());
+            let body = "y".repeat(size);
+            let stdout = format!("{body}\n{FOOTER}{} exit 0", dir.display());
+            let input = post(&stdout, json!({}));
+            let output = hook(input.to_string().as_bytes(), &env(temp.path()))
+                .unwrap()
+                .unwrap();
+            let text = output["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+                .as_str()
+                .unwrap();
+            assert_eq!(text.contains(&body), shown, "{size}");
+            assert_eq!(text.contains("output not shown"), !shown, "{size}");
+        }
     }
 
     #[test]

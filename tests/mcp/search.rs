@@ -17,6 +17,12 @@ pub const TESTS: &[(&str, Test)] = &[
     ("search_keeps_matches_after_a_provider_failure", || {
         Box::pin(search_keeps_matches_after_a_provider_failure())
     }),
+    ("search_a_recovered_split_is_complete", || {
+        Box::pin(search_a_recovered_split_is_complete())
+    }),
+    ("search_an_outage_is_not_split", || {
+        Box::pin(search_an_outage_is_not_split())
+    }),
     ("search_shows_five_ranges_and_reports_all", || {
         Box::pin(search_shows_five_ranges_and_reports_all())
     }),
@@ -254,14 +260,14 @@ async fn search_keeps_matches_after_a_provider_failure() {
     let world = World::new();
     payments(&world);
     world.file("src/payments/late.go", "package payments\n");
-    // Any batch that holds late.go fails with a passing error, so it is split until late.go
-    // fails alone. The other halves succeed.
+    // Any batch that holds late.go is overloaded, so it is split until late.go fails alone,
+    // after its one retry. The other halves succeed.
     let jev = FakeJev::start(|_, request| {
         let has_late = request["state"]["items"]
             .as_array()
             .is_some_and(|items| items.iter().any(|i| i["path"] == "src/payments/late.go"));
         if has_late {
-            Reply::status(500, "{}")
+            Reply::status(529, "{}").header("retry-after", "0")
         } else {
             navigation(request, payments_score)
         }
@@ -438,6 +444,56 @@ async fn search_contextual_pass_adds_and_retracts() {
     assert!(!report.contains("func Refund"), "excerpts are never stored");
 }
 
+async fn search_a_recovered_split_is_complete() {
+    let world = World::new();
+    payments(&world);
+    // The first batch of several items is overloaded once; its halves succeed.
+    let overloaded = std::sync::atomic::AtomicBool::new(false);
+    let jev = FakeJev::start(move |_, request| {
+        let items = request["state"]["items"].as_array().map_or(0, |i| i.len());
+        if items > 1 && !overloaded.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            Reply::status(529, "{}")
+        } else {
+            navigation(request, payments_score)
+        }
+    })
+    .await;
+    let mut client = world.default_server(&jev).await;
+    let result = client.call("search", search_args(&world, json!({}))).await;
+    let output = structured(&result);
+    assert_eq!(output["status"], "complete", "{output}");
+    assert_eq!(output["issues"], json!([]));
+    assert_eq!(output["matches_found"], 2);
+}
+
+async fn search_an_outage_is_not_split() {
+    let world = World::new();
+    payments(&world);
+    let jev = FakeJev::start(|_, request| {
+        if request["state"]["items"]
+            .as_array()
+            .is_some_and(|i| i.len() > 1)
+        {
+            Reply::status(500, "{}")
+        } else {
+            navigation(request, payments_score)
+        }
+    })
+    .await;
+    let mut client = world.default_server(&jev).await;
+    let result = client.call("search", search_args(&world, json!({}))).await;
+    let output = structured(&result);
+    assert_eq!(output["status"], "incomplete");
+    let singles = (0..jev.requests())
+        .filter(|&i| {
+            jev.body(i)["state"]["items"]
+                .as_array()
+                .is_some_and(|items| items.len() == 1)
+        })
+        .count();
+    assert_eq!(singles, 0, "a 500 does not split a batch into new requests");
+}
+
 async fn search_failed_contextual_pass_keeps_ranges() {
     let world = World::new();
     ledger(&world);
@@ -562,7 +618,17 @@ async fn search_invalid_input() {
         assert_eq!(result["isError"], true, "{arguments}: {result}");
         let output = structured(&result);
         assert_eq!(output["error"]["code"], "invalid_input");
-        assert_eq!(output["report_path"], Value::Null);
+        let report: Value = serde_json::from_str(
+            &std::fs::read_to_string(output["report_path"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["error"]["code"], "invalid_input");
+        assert_eq!(report["status"], "incomplete");
+        assert_eq!(report["coverage"]["files_considered"], 0);
+        assert_eq!(report["usage"]["input_tokens"], 0);
+        assert_eq!(report["matches"], json!([]));
+        assert!(report["constants"]["threshold"].is_number());
+        assert!(report["exclusions"].as_array().unwrap().len() >= 9);
     }
     assert_eq!(jev.requests(), 0);
 }

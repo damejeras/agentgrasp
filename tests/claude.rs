@@ -70,6 +70,20 @@ fn settings(extra: Value) -> Value {
 }
 
 fn claude(project: &Project, settings: &Value, command: &str) -> Run {
+    let prompt = format!(
+        "Call the Bash tool exactly once with this exact command and nothing else, then reply DONE: {command}"
+    );
+    claude_with(project, settings, &prompt, &[], &[])
+}
+
+/// Runs Claude Code on `prompt` with extra arguments and environment variables.
+fn claude_with(
+    project: &Project,
+    settings: &Value,
+    prompt: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Run {
     let settings_path = project.dir.parent().unwrap().join("settings.json");
     std::fs::write(&settings_path, settings.to_string()).unwrap();
     let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin");
@@ -78,10 +92,9 @@ fn claude(project: &Project, settings: &Value, command: &str) -> Run {
         binary().parent().unwrap().display(),
         std::env::var("PATH").unwrap()
     );
-    let prompt = format!(
-        "Call the Bash tool exactly once with this exact command and nothing else, then reply DONE: {command}"
-    );
-    let output = Command::new("claude")
+    let mut command = Command::new("claude");
+    command.args(args).envs(envs.iter().copied());
+    let output = command
         .args(["-p", "--setting-sources", "", "--settings"])
         .arg(&settings_path)
         .arg("--plugin-dir")
@@ -96,7 +109,7 @@ fn claude(project: &Project, settings: &Value, command: &str) -> Run {
             "stream-json",
             "--verbose",
             "--no-session-persistence",
-            &prompt,
+            prompt,
         ])
         .current_dir(&project.dir)
         .env("PATH", path)
@@ -214,4 +227,76 @@ fn the_sandbox_with_the_readme_setting_captures_a_failing_command() {
             .count(),
         2000
     );
+}
+
+#[test]
+#[ignore = "runs the real Claude Code"]
+fn claude_code_shell_picks_the_shell_that_is_checked() {
+    let project = project();
+    let bash = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|d| d.join("bash"))
+        .find(|p| p.is_file())
+        .expect("bash on PATH");
+    let bash = bash.to_string_lossy().into_owned();
+    let prompt = "Call the Bash tool exactly once with this exact command and nothing else, then reply DONE: seq 1 3";
+    let run = claude_with(
+        &project,
+        &settings(json!({})),
+        prompt,
+        &[],
+        &[("CLAUDE_CODE_SHELL", &bash), ("SHELL", "/bin/sh")],
+    );
+    assert!(run.denials.is_empty(), "{:?}", run.denials);
+    let captures = project.state.join("agentgrasp/captures");
+    let dir = std::fs::read_dir(captures)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let metadata: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("metadata.json")).unwrap()).unwrap();
+    assert_eq!(metadata["shell"], bash);
+}
+
+#[test]
+#[ignore = "runs the real Claude Code"]
+fn an_added_directory_is_an_mcp_root() {
+    let project = project();
+    let added = project.dir.parent().unwrap().join("added");
+    std::fs::create_dir_all(&added).unwrap();
+    std::fs::write(added.join("notes.txt"), "notes").unwrap();
+    let outside = project.dir.parent().unwrap().join("outside.txt");
+    std::fs::write(&outside, "outside").unwrap();
+    let mut allowed = settings(json!({}));
+    allowed["permissions"]["allow"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("mcp__agentgrasp__ask"));
+    // --strict-mcp-config leaves out plugin servers, so the server is given here.
+    let servers =
+        json!({"mcpServers": {"agentgrasp": {"command": binary(), "args": ["mcp"]}}}).to_string();
+    let prompt = format!(
+        "Call the agentgrasp ask MCP tool twice, then reply DONE. First with paths [\"{}\"] and questions [\"Is it text?\"]. Then with paths [\"{}\"] and questions [\"Is it text?\"].",
+        added.join("notes.txt").display(),
+        outside.display()
+    );
+    let added_arg = added.to_string_lossy().into_owned();
+    // Without a key, an allowed path gives provider_unavailable and a refused one invalid_input.
+    let run = claude_with(
+        &project,
+        &allowed,
+        &prompt,
+        &["--add-dir", &added_arg, "--mcp-config", &servers],
+        &[("TYPESAFE_API_KEY", "")],
+    );
+    let texts: Vec<&String> = run
+        .results
+        .iter()
+        .map(|(text, _)| text)
+        .filter(|t| t.contains("evaluation_status"))
+        .collect();
+    assert_eq!(texts.len(), 2, "{:?}", run.results);
+    assert!(texts[0].contains("provider_unavailable"), "{}", texts[0]);
+    assert!(texts[1].contains("invalid_input"), "{}", texts[1]);
 }

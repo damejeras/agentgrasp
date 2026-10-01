@@ -978,6 +978,29 @@ mod tests {
     use crate::jev;
 
     #[tokio::test]
+    async fn an_exhausted_request_budget_ends_the_search_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::write(scope.join("a.rs"), "fn a() {}").unwrap();
+        let policy = fs::Policy {
+            scope,
+            include: None,
+            exclude: None,
+            protected: Vec::new(),
+        };
+        let cancel = CancellationToken::new();
+        let evaluator =
+            Evaluator::new(jev::Client::new("http://127.0.0.1:9/", "k"), cancel.clone());
+        evaluator.use_requests(super::super::evaluator::REQUEST_LIMIT);
+        let found = Context::new("q".into(), Filesystem::new(policy), evaluator, cancel)
+            .run()
+            .await;
+        assert!(!found.interrupted);
+        assert_eq!(found.error.unwrap().code, Code::BudgetExhausted);
+        assert_eq!(found.issues[0].kind, "budget");
+    }
+
+    #[tokio::test]
     async fn a_search_cancelled_before_discovery_is_only_interrupted() {
         let temp = tempfile::tempdir().unwrap();
         let scope = std::fs::canonicalize(temp.path()).unwrap();

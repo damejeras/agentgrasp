@@ -66,5 +66,11 @@ Use `$XDG_STATE_HOME/agentgrasp` instead when `XDG_STATE_HOME` is set.
 - A runaway command can fill the disk until Claude Code's timeout stops it.
 - Claude Code gives agentgrasp stdout and stderr as one stream, so the saved output has them
   together, in the order Claude Code captured them.
+- A Bash call always ends with status 0, so Claude Code reports a failed command as a success;
+  the summary gives the command's real exit code.
 - A command that ends the shell with a non-zero status, such as `exit 1` or `exec false`, skips
   the summary. Claude Code then shows its own, shortened output.
+
+## Links
+
+- MCP Registry name: `mcp-name: io.github.damejeras/agentgrasp`

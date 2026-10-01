@@ -186,7 +186,7 @@ impl std::fmt::Display for Denied {
 }
 
 /// A path that `ask` may read.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Allowed {
     /// The path as given.
     pub given: PathBuf,
@@ -233,8 +233,14 @@ pub fn allow_scope(path: &Path, roots: &Roots) -> Result<PathBuf, Denied> {
     }
     let given = normalize(path);
     let resolved = resolve(path).map_err(|_| Denied::Unresolvable)?;
-    if roots.containing(&given).is_none() || roots.containing(&resolved).is_none() {
+    let (Some(given_root), Some(resolved_root)) =
+        (roots.containing(&given), roots.containing(&resolved))
+    else {
         return Err(Denied::OutsideRoots);
+    };
+    // A scope inside a credential directory would read what a search of its root excludes.
+    if has_sensitive_name(given_root, &given) || has_sensitive_name(resolved_root, &resolved) {
+        return Err(Denied::Sensitive);
     }
     Ok(resolved)
 }
@@ -453,6 +459,17 @@ mod tests {
         assert_eq!(
             allow_scope(&base, &roots).unwrap_err(),
             Denied::OutsideRoots
+        );
+        std::fs::create_dir_all(base.join("root/credentials/inner")).unwrap();
+        let inside_credentials = base.join("root/credentials/inner");
+        assert_eq!(
+            allow_scope(&inside_credentials, &roots).unwrap_err(),
+            Denied::Sensitive
+        );
+        symlink(base.join("root/credentials"), base.join("root/plain")).unwrap();
+        assert_eq!(
+            allow_scope(&base.join("root/plain"), &roots).unwrap_err(),
+            Denied::Sensitive
         );
     }
 }

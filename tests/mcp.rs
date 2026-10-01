@@ -78,6 +78,9 @@ fn main() {
         ("cancellation_is_recorded", || {
             Box::pin(cancellation_is_recorded())
         }),
+        ("a_record_that_cannot_be_written_keeps_the_answers", || {
+            Box::pin(a_record_that_cannot_be_written_keeps_the_answers())
+        }),
         ("production_binary_smoke", || {
             Box::pin(production_binary_smoke())
         }),
@@ -667,6 +670,37 @@ async fn cancellation_is_recorded() {
     };
     assert_eq!(record["error"]["code"], "cancelled");
     assert_eq!(record["requests"].as_array().unwrap().len(), 1);
+}
+
+async fn a_record_that_cannot_be_written_keeps_the_answers() {
+    use std::os::unix::fs::PermissionsExt;
+    let world = World::new();
+    let file = world.file("a.log", "text");
+    std::fs::create_dir_all(&world.state).unwrap();
+    std::fs::set_permissions(&world.state, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let jev = answering_jev().await;
+    let mut client = world.default_server(&jev).await;
+    let result = client
+        .call("ask", json!({"paths": [file], "questions": ["yes?"]}))
+        .await;
+    let output = structured(&result);
+    assert_eq!(output["evaluation_status"], "complete", "{result}");
+    assert_eq!(output["error"], Value::Null);
+    assert_eq!(output["record_path"], Value::Null);
+    assert_eq!(output["answers"][0]["p_yes"], 0.95);
+    let mut keyless = world
+        .server(&jev, None, Some(vec![world.root.clone()]))
+        .await;
+    let result = keyless
+        .call("ask", json!({"paths": [file], "questions": ["yes?"]}))
+        .await;
+    let output = structured(&result);
+    assert_eq!(
+        output["error"]["code"], "provider_unavailable",
+        "the evaluation error stays"
+    );
+    assert_eq!(output["record_path"], Value::Null);
+    std::fs::set_permissions(&world.state, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 /// The real binary, as Claude Code starts it: no key, so no provider is needed.

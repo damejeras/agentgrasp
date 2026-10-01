@@ -1,0 +1,27 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.damejeras/agentgrasp",
+  "title": "agentgrasp",
+  "description": "Yes/no questions about local files, and relevant-file search, with TypeSafe Jev",
+  "repository": {
+    "url": "https://github.com/damejeras/agentgrasp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "cargo",
+      "identifier": "agentgrasp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ]
+    }
+  ]
+}

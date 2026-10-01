@@ -158,6 +158,9 @@ impl jev::Gate for Admission<'_> {
         if let Some(usage) = attempt.usage {
             *ticket.lock().unwrap() = usage.input_tokens;
         }
+        if let Some(model) = &attempt.model {
+            *self.evaluator.model.lock().unwrap() = Some(model.clone());
+        }
         self.evaluator
             .attempts
             .lock()
@@ -187,12 +190,18 @@ impl Evaluator {
         }
     }
 
+    /// Counts `n` requests as used, for tests of the request limit.
+    #[cfg(test)]
+    pub(crate) fn use_requests(&self, n: usize) {
+        self.requests.fetch_add(n, Ordering::SeqCst);
+    }
+
     /// Every HTTP request so far, for the report.
     pub fn attempts(&self) -> Vec<Attempt> {
         self.attempts.lock().unwrap().clone()
     }
 
-    /// The model that Jev reported, once a request succeeded.
+    /// The model that Jev last reported, also in an answer set that was invalid.
     pub fn model(&self) -> Option<String> {
         self.model.lock().unwrap().clone()
     }
@@ -232,10 +241,7 @@ impl Evaluator {
             )
             .await;
         match outcome.result {
-            Ok(answers) => {
-                *self.model.lock().unwrap() = Some(answers.model);
-                Ok(answers.probabilities)
-            }
+            Ok(answers) => Ok(answers.probabilities),
             Err(failure) => Err(self.error(failure, navigation && multiple)),
         }
     }
@@ -254,20 +260,10 @@ impl Evaluator {
             Failure::Cancelled => EvalError::Cancelled,
             Failure::BudgetExhausted => EvalError::BudgetExhausted,
             failure => {
-                // jevgrep splits a navigation batch on any passing failure except 429.
-                let passing = matches!(
-                    failure,
-                    Failure::Overloaded
-                        | Failure::TimedOut
-                        | Failure::Unavailable { status: None }
-                        | Failure::Unavailable {
-                            status: Some(408 | 500..=599)
-                        }
-                );
-                EvalError::Provider {
-                    split: batch && passing,
-                    failure,
-                }
+                // Only an overloaded server splits a batch: other errors are not retried, and
+                // splitting a batch sends its items again.
+                let split = batch && failure == Failure::Overloaded;
+                EvalError::Provider { split, failure }
             }
         }
     }

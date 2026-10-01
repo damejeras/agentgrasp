@@ -44,6 +44,8 @@ pub struct Attempt {
     pub status: Option<u16>,
     pub latency_ms: u64,
     pub usage: Option<Usage>,
+    /// The model that the response names, also when its answers are invalid.
+    pub model: Option<String>,
 }
 
 #[derive(Debug)]
@@ -174,6 +176,10 @@ impl Client {
                 } => Some(reply),
             };
             let latency_ms = started.elapsed().as_millis() as u64;
+            let model = match &reply {
+                Some(Ok((status, _, bytes))) if *status == StatusCode::OK => reported_model(bytes),
+                _ => None,
+            };
             let (status, usage) = match &reply {
                 Some(Ok((status, _, bytes))) if *status == StatusCode::OK => {
                     (Some(status.as_u16()), reported_usage(bytes))
@@ -185,6 +191,7 @@ impl Client {
                 status,
                 latency_ms,
                 usage,
+                model,
             };
             gate.record(ticket, &record);
             attempts.push(record);
@@ -306,6 +313,17 @@ fn is_too_large(body: &[u8]) -> bool {
     }
     serde_json::from_slice::<Body>(body)
         .is_ok_and(|body| body.detail.error_type == "max_tokens_exceeded")
+}
+
+/// The model that a 200 response names, also when its answers are invalid.
+fn reported_model(body: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Body {
+        model: String,
+    }
+    serde_json::from_slice::<Body>(body)
+        .ok()
+        .map(|body| body.model)
 }
 
 /// The usage of a 200 response, also when its answers are invalid: the request was billed.

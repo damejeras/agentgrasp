@@ -66,21 +66,8 @@ pub enum Failure {
     TimedOut,
     InvalidResponse,
     Cancelled,
-}
-
-impl Failure {
-    /// The error code of the MCP tools.
-    pub fn code(&self) -> &'static str {
-        match self {
-            Failure::TooLarge => "input_too_large",
-            Failure::InvalidResponse => "invalid_provider_response",
-            Failure::Cancelled => "cancelled",
-            Failure::Unauthorized
-            | Failure::Overloaded
-            | Failure::Unavailable { .. }
-            | Failure::TimedOut => "provider_unavailable",
-        }
-    }
+    /// A gate refused the attempt: the search used all its requests.
+    BudgetExhausted,
 }
 
 // The text never holds a response body: a body can echo the request, which holds file content.
@@ -99,6 +86,7 @@ impl fmt::Display for Failure {
             Failure::TimedOut => f.write_str("TypeSafe did not answer in time"),
             Failure::InvalidResponse => f.write_str("TypeSafe returned an invalid answer set"),
             Failure::Cancelled => f.write_str("the request was cancelled"),
+            Failure::BudgetExhausted => f.write_str("the search used all its Jev requests"),
         }
     }
 }
@@ -124,14 +112,17 @@ impl Client {
     }
 
     /// Asks every question about `state` in one request. Each answer is checked: every key is
-    /// present once, nothing else is, and each value is a `noul` probability in [0, 1].
-    pub async fn evaluate(
+    /// present once, nothing else is, and each value is a `noul` probability in [0, 1]. `gate`
+    /// admits each HTTP attempt. `deadline` bounds the whole call, waits included; without
+    /// one, each attempt is bounded by `REQUEST_TIMEOUT` from when it is sent.
+    pub async fn evaluate<G: Gate>(
         &self,
         state: &Value,
         questions: &[Question],
         retry: Retry,
-        deadline: Instant,
+        deadline: Option<Instant>,
         cancel: &CancellationToken,
+        gate: &G,
     ) -> Outcome {
         let body = json!({
             "model": MODEL,
@@ -143,46 +134,68 @@ impl Client {
         });
         let mut attempts = Vec::new();
         for attempt in 0..ATTEMPTS {
+            let ticket = match gate.admit().await {
+                Ok(ticket) => ticket,
+                Err(failure) => {
+                    return Outcome {
+                        result: Err(failure),
+                        attempts,
+                    };
+                }
+            };
             let started = Instant::now();
-            let Some(left) = deadline
-                .checked_duration_since(started)
-                .filter(|d| !d.is_zero())
-            else {
-                return Outcome {
-                    result: Err(Failure::TimedOut),
-                    attempts,
-                };
+            let left = match deadline {
+                None => REQUEST_TIMEOUT,
+                Some(deadline) => match deadline.checked_duration_since(started) {
+                    Some(left) if !left.is_zero() => left.min(REQUEST_TIMEOUT),
+                    _ => {
+                        return Outcome {
+                            result: Err(Failure::TimedOut),
+                            attempts,
+                        };
+                    }
+                },
             };
             let send = self
                 .http
                 .post(&self.endpoint)
                 .bearer_auth(&self.key)
                 .json(&body)
-                .timeout(left.min(REQUEST_TIMEOUT))
+                .timeout(left)
                 .send();
             let reply = tokio::select! {
-                _ = cancel.cancelled() => {
-                    let latency_ms = started.elapsed().as_millis() as u64;
-                    attempts.push(Attempt { status: None, latency_ms, usage: None });
-                    return Outcome { result: Err(Failure::Cancelled), attempts };
-                }
+                _ = cancel.cancelled() => None,
                 reply = async {
                     let response = send.await?;
                     let status = response.status();
                     let retry_after = retry_after(response.headers());
                     let bytes = response.bytes().await?;
                     Ok::<_, reqwest::Error>((status, retry_after, bytes))
-                } => reply,
+                } => Some(reply),
             };
             let latency_ms = started.elapsed().as_millis() as u64;
+            let (status, usage) = match &reply {
+                Some(Ok((status, _, bytes))) if *status == StatusCode::OK => {
+                    (Some(status.as_u16()), reported_usage(bytes))
+                }
+                Some(Ok((status, _, _))) => (Some(status.as_u16()), None),
+                _ => (None, None),
+            };
+            let record = Attempt {
+                status,
+                latency_ms,
+                usage,
+            };
+            gate.record(ticket, &record);
+            attempts.push(record);
             let (status, retry_after, bytes) = match reply {
-                Ok(reply) => reply,
-                Err(error) => {
-                    attempts.push(Attempt {
-                        status: None,
-                        latency_ms,
-                        usage: None,
-                    });
+                None => {
+                    return Outcome {
+                        result: Err(Failure::Cancelled),
+                        attempts,
+                    };
+                }
+                Some(Err(error)) => {
                     let failure = if error.is_timeout() {
                         Failure::TimedOut
                     } else {
@@ -193,38 +206,27 @@ impl Client {
                         attempts,
                     };
                 }
+                Some(Ok(reply)) => reply,
             };
-            let code = status.as_u16();
             if status == StatusCode::OK {
-                attempts.push(Attempt {
-                    status: Some(code),
-                    latency_ms,
-                    usage: reported_usage(&bytes),
-                });
-                let result = parse(&bytes, questions);
-                return Outcome { result, attempts };
+                return Outcome {
+                    result: parse(&bytes, questions),
+                    attempts,
+                };
             }
-            attempts.push(Attempt {
-                status: Some(code),
-                latency_ms,
-                usage: None,
-            });
+            let code = status.as_u16();
             let last = attempt + 1 == ATTEMPTS;
+            let pause = retry_after.unwrap_or(RETRY_WAIT);
+            if code == 429 {
+                // Other requests of the same search wait as well, as in jevgrep.
+                gate.back_off(pause);
+            }
             let failure = match code {
                 401 | 403 => Failure::Unauthorized,
                 400 if is_too_large(&bytes) => Failure::TooLarge,
-                429 if !last => {
-                    if !wait(retry_after.unwrap_or(RETRY_WAIT), deadline, cancel).await {
-                        return Outcome {
-                            result: Err(stopped(cancel)),
-                            attempts,
-                        };
-                    }
-                    continue;
-                }
                 OVERLOADED if retry == Retry::SplitOnOverload => Failure::Overloaded,
-                OVERLOADED if !last => {
-                    if !wait(retry_after.unwrap_or(RETRY_WAIT), deadline, cancel).await {
+                429 | OVERLOADED if !last => {
+                    if !wait(pause, deadline, cancel).await {
                         return Outcome {
                             result: Err(stopped(cancel)),
                             attempts,
@@ -243,6 +245,30 @@ impl Client {
     }
 }
 
+/// Admits each HTTP attempt of a call. A search uses it to keep its request and rate budgets
+/// across all its concurrent calls.
+pub trait Gate: Sync {
+    type Ticket: Send;
+    /// Waits until an attempt may start. A failure stops the call before that attempt.
+    fn admit(&self) -> impl std::future::Future<Output = Result<Self::Ticket, Failure>> + Send;
+    /// Records an attempt that was sent.
+    fn record(&self, ticket: Self::Ticket, attempt: &Attempt);
+    /// The server asked every request to wait for `pause`.
+    fn back_off(&self, pause: Duration);
+}
+
+/// A gate that admits every attempt at once.
+pub struct Open;
+
+impl Gate for Open {
+    type Ticket = ();
+    fn admit(&self) -> impl std::future::Future<Output = Result<(), Failure>> + Send {
+        std::future::ready(Ok(()))
+    }
+    fn record(&self, _: (), _: &Attempt) {}
+    fn back_off(&self, _: Duration) {}
+}
+
 fn stopped(cancel: &CancellationToken) -> Failure {
     if cancel.is_cancelled() {
         Failure::Cancelled
@@ -252,8 +278,8 @@ fn stopped(cancel: &CancellationToken) -> Failure {
 }
 
 /// Waits before a retry. False when the deadline would pass first or the call is cancelled.
-async fn wait(duration: Duration, deadline: Instant, cancel: &CancellationToken) -> bool {
-    if duration >= deadline.saturating_duration_since(Instant::now()) {
+async fn wait(duration: Duration, deadline: Option<Instant>, cancel: &CancellationToken) -> bool {
+    if deadline.is_some_and(|d| duration >= d.saturating_duration_since(Instant::now())) {
         return false;
     }
     tokio::select! {

@@ -5,6 +5,9 @@
 
 mod support;
 
+#[path = "mcp/search.rs"]
+mod search;
+
 use std::future::Future;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
@@ -15,6 +18,8 @@ use serde_json::{Value, json};
 use support::mcp::McpClient;
 use support::{FakeJev, Reply};
 use tokio::process::Command;
+
+type Test = fn() -> Pin<Box<dyn Future<Output = ()>>>;
 
 const CHILD_ENV: &str = "AGENTGRASP_TEST_JEV";
 const MARKER: &str = "SOURCE-TEXT-MARKER-7f3a";
@@ -30,7 +35,6 @@ fn main() {
         runtime.block_on(agentgrasp::mcp::serve(config)).unwrap();
         return;
     }
-    type Test = fn() -> Pin<Box<dyn Future<Output = ()>>>;
     let tests: Vec<(&str, Test)> = vec![
         ("lists_ask_with_schemas", || {
             Box::pin(lists_ask_with_schemas())
@@ -78,6 +82,10 @@ fn main() {
             Box::pin(production_binary_smoke())
         }),
     ];
+    let tests: Vec<(&str, Test)> = tests
+        .into_iter()
+        .chain(search::TESTS.iter().copied())
+        .collect();
     let filter: Option<String> = std::env::args().skip(1).find(|arg| !arg.starts_with('-'));
     let mut failed = Vec::new();
     for (name, test) in tests {

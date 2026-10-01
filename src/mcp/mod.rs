@@ -3,6 +3,7 @@
 
 pub mod ask;
 pub mod locations;
+pub mod search;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,6 +53,7 @@ impl Code {
             Failure::TooLarge => Code::InputTooLarge,
             Failure::InvalidResponse => Code::InvalidProviderResponse,
             Failure::Cancelled => Code::Cancelled,
+            Failure::BudgetExhausted => Code::BudgetExhausted,
             Failure::Unauthorized
             | Failure::Overloaded
             | Failure::Unavailable { .. }
@@ -130,8 +132,10 @@ impl ServerHandler for Server {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Ask yes/no questions about local files, such as captured command output. \
-                 The answers are probabilities; read the files for anything else.",
+                "ask answers yes/no questions about local files, such as captured command \
+                 output, as probabilities. search finds the files and regions relevant to a \
+                 question, as locations and scores. Neither returns file content; read the \
+                 files for that.",
             )
     }
 
@@ -154,6 +158,10 @@ impl ServerHandler for Server {
                 let output = ask::call(&self.config, arguments, &context).await;
                 Ok(result(&output, output.error.as_ref()))
             }
+            "search" => {
+                let output = search::call(&self.config, arguments, &context).await;
+                Ok(result(&output, output.error.as_ref()))
+            }
             name => Err(McpError::invalid_params(
                 format!("unknown tool: {name}"),
                 None,
@@ -171,6 +179,9 @@ fn tools() -> Vec<Tool> {
         Tool::new("ask", ask::DESCRIPTION, Arc::new(Default::default()))
             .with_input_schema::<ask::Input>()
             .with_output_schema::<ask::Output>(),
+        Tool::new("search", search::DESCRIPTION, Arc::new(Default::default()))
+            .with_input_schema::<search::Input>()
+            .with_output_schema::<search::Output>(),
     ]
 }
 

@@ -272,7 +272,14 @@ async fn run(
         .collect();
     let client = jev::Client::new(&config.endpoint, key);
     let outcome = client
-        .evaluate(&state, &keyed, Retry::Standard, deadline, cancel)
+        .evaluate(
+            &state,
+            &keyed,
+            Retry::Standard,
+            Some(deadline),
+            cancel,
+            &jev::Open,
+        )
         .await;
     match outcome.result {
         Ok(answers) => Run {

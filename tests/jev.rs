@@ -2,7 +2,7 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use agentgrasp::jev::{Client, Failure, Outcome, Question, Retry};
+use agentgrasp::jev::{Client, Failure, Open, Outcome, Question, Retry};
 use serde_json::{Value, json};
 use support::{FakeJev, Reply};
 use tokio_util::sync::CancellationToken;
@@ -26,8 +26,9 @@ async fn evaluate(server: &FakeJev, qs: &[Question], retry: Retry, within: Durat
             &state,
             qs,
             retry,
-            Instant::now() + within,
+            Some(Instant::now() + within),
             &CancellationToken::new(),
+            &Open,
         )
         .await
 }
@@ -246,8 +247,9 @@ async fn cancellation_stops_the_call() {
             &json!({}),
             &questions(&["a"]),
             Retry::Standard,
-            Instant::now() + Duration::from_secs(10),
+            Some(Instant::now() + Duration::from_secs(10)),
             &cancel,
+            &Open,
         )
         .await;
     assert_eq!(outcome.result.unwrap_err(), Failure::Cancelled);
@@ -284,8 +286,9 @@ async fn an_unreachable_server_is_unavailable() {
             &json!({}),
             &questions(&["a"]),
             Retry::Standard,
-            Instant::now() + Duration::from_secs(5),
+            Some(Instant::now() + Duration::from_secs(5)),
             &CancellationToken::new(),
+            &Open,
         )
         .await;
     assert_eq!(
@@ -342,8 +345,9 @@ async fn a_cancelled_request_is_recorded() {
             &json!({}),
             &questions(&["a"]),
             Retry::Standard,
-            Instant::now() + Duration::from_secs(10),
+            Some(Instant::now() + Duration::from_secs(10)),
             &cancel,
+            &Open,
         )
         .await;
     assert_eq!(outcome.result.unwrap_err(), Failure::Cancelled);

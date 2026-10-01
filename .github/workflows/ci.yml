@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      # The hook tests run in bash and in zsh. macOS has zsh; Ubuntu does not.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y zsh
+      - run: cargo test --locked

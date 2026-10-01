@@ -1,0 +1,24 @@
+[package]
+name = "agentgrasp"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Keeps long command output out of a coding agent's context, and answers yes/no questions about files with Jev"
+repository = "https://github.com/damejeras/agentgrasp"
+readme = "README.md"
+keywords = ["mcp", "claude", "hook", "agent", "search"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+anyhow = "1.0.104"
+libc = "0.2.189"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

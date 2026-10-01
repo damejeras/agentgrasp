@@ -13,13 +13,21 @@ categories = ["command-line-utilities", "development-tools"]
 anyhow = "1.0.104"
 libc = "0.2.189"
 reqwest = { version = "0.13.5", features = ["json"] }
+rmcp = { version = "3.5.0", features = ["server", "transport-io", "macros"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "fs"] }
 tokio-util = "0.7.19"
 
 [dev-dependencies]
+tokio = { version = "1.53.1", features = ["process"] }
 tempfile = "3.27.0"
+
+# Runs the MCP server in a child process with a fake Jev server; see tests/mcp.rs.
+[[test]]
+name = "mcp"
+harness = false
 
 # The profile that 'dist' will build with
 [profile.dist]

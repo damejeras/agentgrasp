@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+pub mod mcp;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

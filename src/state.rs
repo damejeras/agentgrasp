@@ -192,7 +192,10 @@ mod tests {
         assert_eq!(dir, temp.path().join("captures/stamp-1"));
         let next = allocate_with(temp.path(), Kind::Capture, "stamp").unwrap();
         assert_eq!(next, temp.path().join("captures/stamp-2"));
-        assert_eq!(std::fs::read_to_string(taken.join("metadata.json")).unwrap(), "kept");
+        assert_eq!(
+            std::fs::read_to_string(taken.join("metadata.json")).unwrap(),
+            "kept"
+        );
     }
 
     #[test]

@@ -17,9 +17,10 @@ use super::evaluator::{EvalError, Evaluator};
 use super::fs::{self, Entry, FileRead, Filesystem, Snapshot};
 use super::preview;
 use super::requests::{
-    ChildEntry, Declaration, DirectoryPreview, FilePreview, Kind, NavigationItem, RelationAnchor,
-    navigation_request,
+    ChildEntry, Declaration, DirectoryPreview, Evidence, FilePreview, Kind, NavigationItem,
+    RelationAnchor, navigation_request,
 };
+use super::selection::{Selection, select_file};
 use super::source;
 use crate::mcp::{Code, ToolError};
 
@@ -636,10 +637,75 @@ impl Context {
     /// Runs the search policy.
     pub async fn run(self: &Arc<Self>) -> Found {
         self.discover(vec![String::new()], None).await;
-        self.finish()
+        let selections = self.select(None, HashMap::new()).await;
+        self.finish(&selections)
     }
 
-    fn finish(&self) -> Found {
+    /// Selects the qualifying regions of every candidate file, up to `CONCURRENCY` files at
+    /// once. With `evidence`, each file is judged again against it, starting from `previous`.
+    async fn select(
+        self: &Arc<Self>,
+        evidence: Option<Arc<Vec<Evidence>>>,
+        mut previous: HashMap<String, Selection>,
+    ) -> HashMap<String, Selection> {
+        let candidates: Vec<Candidate> = self
+            .state
+            .lock()
+            .unwrap()
+            .candidates
+            .values()
+            .cloned()
+            .collect();
+        let mut selections = HashMap::new();
+        let mut queue: VecDeque<Candidate> = candidates.into();
+        let mut running = JoinSet::new();
+        loop {
+            while running.len() < super::evaluator::CONCURRENCY && !self.stopped() {
+                let Some(candidate) = queue.pop_front() else {
+                    break;
+                };
+                let Some(snapshot) = self.snapshot(&candidate.path) else {
+                    continue;
+                };
+                if snapshot.source.len() > MAX_INSPECTED_BYTES {
+                    self.issue(
+                        "inspection_limit",
+                        Code::InputTooLarge,
+                        "a file is too large to select regions from",
+                        vec![candidate.path.clone()],
+                    );
+                    continue;
+                }
+                let context = self.clone();
+                let evidence = evidence.clone();
+                let prior = previous.remove(&candidate.path);
+                running.spawn(async move {
+                    let selection = select_file(
+                        &context.evaluator,
+                        &context.query,
+                        &snapshot,
+                        evidence.as_ref().map(|e| e.as_slice()),
+                        prior,
+                    )
+                    .await;
+                    (candidate.path, selection)
+                });
+            }
+            let Some(joined) = running.join_next().await else {
+                break;
+            };
+            let (path, selection) = joined.expect("a selection task does not panic");
+            for failure in &selection.failures {
+                self.eval_issue(failure, vec![path.clone()]);
+            }
+            selections.insert(path, selection);
+        }
+        // A file that was not judged again keeps its earlier selection.
+        selections.extend(previous);
+        selections
+    }
+
+    fn finish(&self, selections: &HashMap<String, Selection>) -> Found {
         if self.cancel.is_cancelled()
             && !self
                 .state
@@ -659,6 +725,19 @@ impl Context {
         }
         let state = self.state.lock().unwrap();
         let mut files: Vec<Candidate> = state.candidates.values().cloned().collect();
+        for file in &mut files {
+            if let Some(selection) = selections.get(&file.path) {
+                file.ranges = selection
+                    .ranges()
+                    .into_iter()
+                    .map(|(range, relevance)| FileRange {
+                        start_line: range.start_line,
+                        end_line: range.end_line,
+                        relevance,
+                    })
+                    .collect();
+            }
+        }
         files.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)

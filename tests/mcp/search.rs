@@ -17,6 +17,12 @@ pub const TESTS: &[(&str, Test)] = &[
     ("search_keeps_matches_after_a_provider_failure", || {
         Box::pin(search_keeps_matches_after_a_provider_failure())
     }),
+    ("search_shows_five_ranges_and_reports_all", || {
+        Box::pin(search_shows_five_ranges_and_reports_all())
+    }),
+    ("search_keeps_a_file_when_selection_fails", || {
+        Box::pin(search_keeps_a_file_when_selection_fails())
+    }),
     ("search_invalid_input", || Box::pin(search_invalid_input())),
     ("search_missing_key_fails_at_start", || {
         Box::pin(search_missing_key_fails_at_start())
@@ -26,8 +32,32 @@ pub const TESTS: &[(&str, Test)] = &[
     }),
 ];
 
-/// Answers navigation requests by item path, and evidence requests with `evidence`.
+/// Answers navigation requests by item path, and evidence requests by declaration name:
+/// relevance and scope from `evidence`, and no references.
 fn navigation(request: &Value, score: impl Fn(&str) -> f64) -> Reply {
+    if let Some(declarations) = request["state"]["declarations"].as_array() {
+        let answers: serde_json::Map<String, Value> = request["questions"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|key| {
+                let digits = key.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+                let name = declarations[digits.parse::<usize>().unwrap()]["name"]
+                    .as_str()
+                    .unwrap();
+                // Relevance is above scope, so the score shows that the smaller one counts.
+                let p = if key.starts_with("ref") {
+                    0.0
+                } else if key.starts_with("scope") {
+                    evidence(name)
+                } else {
+                    (evidence(name) + 0.04).min(1.0)
+                };
+                (key.clone(), json!({"type": "noul", "noul": p}))
+            })
+            .collect();
+        return Reply::status(200, json!({"model": "jev-sel", "answers": answers, "usage": {"input_tokens": 5, "output_tokens": 1}}).to_string());
+    }
     let items = request["state"]["items"]
         .as_array()
         .cloned()
@@ -46,6 +76,14 @@ fn navigation(request: &Value, score: impl Fn(&str) -> f64) -> Reply {
         })
         .collect();
     Reply::status(200, json!({"model": "jev-nav", "answers": answers, "usage": {"input_tokens": 7, "output_tokens": 1}}).to_string())
+}
+
+fn evidence(name: &str) -> f64 {
+    match name {
+        "Refund" => 0.93,
+        name if name.starts_with("Check") => 0.8,
+        _ => 0.1,
+    }
 }
 
 fn payments_score(path: &str) -> f64 {
@@ -92,7 +130,7 @@ async fn search_ranks_files_and_reports() {
     not_error(&result);
     let output = structured(&result);
     assert_eq!(output["status"], "complete", "{output}");
-    assert_eq!(output["model"], "jev-nav");
+    assert!(output["model"].as_str().unwrap().starts_with("jev-"));
     assert_eq!(output["error"], Value::Null);
     let matches = output["matches"].as_array().unwrap();
     let paths: Vec<&str> = matches
@@ -110,7 +148,15 @@ async fn search_ranks_files_and_reports() {
     assert_eq!(matches[0]["relevance"], 0.97);
     let bytes = std::fs::read(world.root.join("src/payments/refunds.go")).unwrap();
     assert_eq!(matches[0]["sha256"], agentgrasp::sha256_hex(&bytes));
-    assert_eq!(matches[0]["ranges"], json!([]));
+    assert_eq!(
+        matches[0]["ranges"],
+        json!([{"start_line": 4, "end_line": 4, "relevance": 0.93}])
+    );
+    assert_eq!(
+        matches[1]["ranges"],
+        json!([]),
+        "a file with no qualifying range stays a match"
+    );
     assert_eq!(output["matches_found"], 2);
     assert_eq!(output["results_limited"], false);
     // README.md, docs/plan.md, refunds.go, refunds_test.go were judged from their previews.
@@ -129,9 +175,26 @@ async fn search_ranks_files_and_reports() {
     assert_eq!(report["matches"].as_array().unwrap().len(), 2);
     assert_eq!(report["status"], "complete");
     assert_eq!(report["requests"].as_array().unwrap().len(), jev.requests());
-    assert_eq!(report["usage"]["input_tokens"], 7 * jev.requests() as u64);
+    let summed: u64 = report["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["usage"]["input_tokens"].as_u64().unwrap())
+        .sum();
+    assert_eq!(report["usage"]["input_tokens"], summed);
+    assert!(report["requests"][0]["latency_ms"].is_u64());
     assert!(report["exclusions"].as_array().unwrap().len() >= 9);
     assert_eq!(report["constants"]["threshold"], 0.5);
+    let selection = &report["constants"]["selection"];
+    assert_eq!(selection["source_unit_bytes"], 24_000);
+    assert_eq!(selection["fallback_unit_bytes"], 3_000);
+    assert_eq!(selection["block_lines"], 16);
+    assert_eq!(selection["group_bytes"], 42_000);
+    assert_eq!(selection["group_units"], 128);
+    assert_eq!(selection["state_bytes"], 80_000);
+    assert_eq!(selection["whole_source_bytes"], 16_000);
+    assert_eq!(selection["context_lines"], 8);
+    assert_eq!(selection["opening_lines"], 20);
     let stdout = client.stdout.join("\n");
     let stderr = client.close().await;
     assert!(!stdout.contains(MARKER) && !stderr.contains(MARKER));
@@ -216,6 +279,60 @@ async fn search_keeps_matches_after_a_provider_failure() {
         report["issue_locations"],
         json!([{"kind": "provider", "code": "provider_unavailable", "path": late}])
     );
+}
+
+async fn search_shows_five_ranges_and_reports_all() {
+    let world = World::new();
+    let checks: String = (1..=7)
+        .map(|i| format!("\nfunc Check{i}() {{\n\treturn\n}}\n"))
+        .collect();
+    world.file(
+        "src/payments/refunds.go",
+        format!("package payments\n{checks}"),
+    );
+    let jev = FakeJev::start(|_, request| navigation(request, payments_score)).await;
+    let mut client = world.default_server(&jev).await;
+    let result = client.call("search", search_args(&world, json!({}))).await;
+    let output = structured(&result);
+    let ranges = output["matches"][0]["ranges"].as_array().unwrap();
+    assert_eq!(ranges.len(), 5);
+    // Equal relevance: by start line. Check1 is on lines 3-5 of the hashed snapshot.
+    assert_eq!(
+        ranges[0],
+        json!({"start_line": 3, "end_line": 5, "relevance": 0.8})
+    );
+    assert_eq!(
+        ranges[4],
+        json!({"start_line": 19, "end_line": 21, "relevance": 0.8})
+    );
+    let report: Value = serde_json::from_str(
+        &std::fs::read_to_string(output["report_path"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report["matches"][0]["ranges"].as_array().unwrap().len(), 7);
+}
+
+async fn search_keeps_a_file_when_selection_fails() {
+    let world = World::new();
+    payments(&world);
+    let jev = FakeJev::start(|_, request| {
+        if request["state"]["declarations"].is_array() {
+            Reply::status(200, "not json")
+        } else {
+            navigation(request, payments_score)
+        }
+    })
+    .await;
+    let mut client = world.default_server(&jev).await;
+    let result = client.call("search", search_args(&world, json!({}))).await;
+    let output = structured(&result);
+    assert_eq!(output["status"], "incomplete");
+    assert_eq!(output["error"]["code"], "invalid_provider_response");
+    assert_eq!(
+        output["matches_found"], 2,
+        "the files stay matches without ranges"
+    );
+    assert_eq!(output["matches"][0]["ranges"], json!([]));
 }
 
 async fn search_invalid_input() {

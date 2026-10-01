@@ -15,6 +15,7 @@ use crate::jev::{self, Usage};
 use crate::search::evaluator::{self, Evaluator};
 use crate::search::fs::{self, Filesystem, Policy};
 use crate::search::retrieve::{self, Context, Found, IssueCount};
+use crate::search::selection;
 use crate::state::{self, Kind};
 
 pub const DESCRIPTION: &str = "\
@@ -331,6 +332,34 @@ fn report(
         .unwrap_or_default();
     let mut exclusions: Vec<String> = fs::EXCLUSIONS.iter().map(|e| e.to_string()).collect();
     exclusions.extend(input.exclude.iter().map(|p| format!("exclude pattern {p}")));
+    let constants = json!({
+        "model": jev::MODEL,
+        "threshold": retrieve::THRESHOLD,
+        "max_entries": retrieve::MAX_ENTRIES,
+        "max_navigation_request_bytes": retrieve::MAX_NAVIGATION_BYTES,
+        "max_batch_items": retrieve::MAX_BATCH_ITEMS,
+        "max_inspected_file_bytes": retrieve::MAX_INSPECTED_BYTES,
+        "max_file_bytes": fs::MAX_FILE_BYTES,
+        "preview_bytes": retrieve::PREVIEW_BYTES,
+        "chunk_bytes": retrieve::CHUNK_BYTES,
+        "request_limit": evaluator::REQUEST_LIMIT,
+        "concurrency": evaluator::CONCURRENCY,
+        "tokens_per_second": evaluator::TOKENS_PER_SECOND,
+        "requests_per_minute": evaluator::REQUESTS_PER_MINUTE,
+        "request_timeout_seconds": jev::REQUEST_TIMEOUT.as_secs(),
+        "ranges_shown": RANGES_SHOWN,
+        "selection": {
+            "source_unit_bytes": selection::SOURCE_UNIT_BYTES,
+            "fallback_unit_bytes": selection::FALLBACK_UNIT_BYTES,
+            "block_lines": selection::BLOCK_LINES,
+            "group_bytes": selection::GROUP_BYTES,
+            "group_units": selection::GROUP_UNITS,
+            "state_bytes": selection::STATE_BYTES,
+            "whole_source_bytes": selection::WHOLE_SOURCE_BYTES,
+            "context_lines": selection::CONTEXT_LINES,
+            "opening_lines": selection::OPENING_LINES,
+        },
+    });
     json!({
         "started_at": state::rfc3339(started_at),
         "latency_ms": clock.elapsed().as_millis() as u64,
@@ -358,23 +387,7 @@ fn report(
         })).collect::<Vec<_>>()).unwrap_or_default(),
         "error": output.error,
         "exclusions": exclusions,
-        "constants": {
-            "model": jev::MODEL,
-            "threshold": retrieve::THRESHOLD,
-            "max_entries": retrieve::MAX_ENTRIES,
-            "max_navigation_request_bytes": retrieve::MAX_NAVIGATION_BYTES,
-            "max_batch_items": retrieve::MAX_BATCH_ITEMS,
-            "max_inspected_file_bytes": retrieve::MAX_INSPECTED_BYTES,
-            "max_file_bytes": fs::MAX_FILE_BYTES,
-            "preview_bytes": retrieve::PREVIEW_BYTES,
-            "chunk_bytes": retrieve::CHUNK_BYTES,
-            "request_limit": evaluator::REQUEST_LIMIT,
-            "concurrency": evaluator::CONCURRENCY,
-            "tokens_per_second": evaluator::TOKENS_PER_SECOND,
-            "requests_per_minute": evaluator::REQUESTS_PER_MINUTE,
-            "request_timeout_seconds": jev::REQUEST_TIMEOUT.as_secs(),
-            "ranges_shown": RANGES_SHOWN,
-        },
+        "constants": constants,
         "usage": usage,
         "requests": attempts,
     })

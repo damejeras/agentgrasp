@@ -363,7 +363,7 @@ fn read_file(
 }
 
 fn write_record(state_root: &Path, record: &serde_json::Value) -> anyhow::Result<PathBuf> {
-    let dir = state::allocate(state_root, Kind::Ask)?;
+    let dir = state::allocate(state_root, Kind::Ask, &std::process::id().to_string())?;
     let path = dir.join("record.json");
     let mut text = serde_json::to_vec_pretty(record)?;
     text.push(b'\n');

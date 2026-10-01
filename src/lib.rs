@@ -1,3 +1,4 @@
+pub mod capture;
 pub mod jev;
 pub mod mcp;
 pub mod search;

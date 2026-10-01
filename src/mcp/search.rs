@@ -399,7 +399,7 @@ fn report(
 }
 
 fn write_report(state_root: &Path, report: &serde_json::Value) -> anyhow::Result<PathBuf> {
-    let dir = state::allocate(state_root, Kind::Search)?;
+    let dir = state::allocate(state_root, Kind::Search, &std::process::id().to_string())?;
     let path = dir.join("report.json");
     let mut text = serde_json::to_vec_pretty(report)?;
     text.push(b'\n');

@@ -43,8 +43,21 @@ pub fn root_from(xdg_state_home: Option<OsString>, home: Option<OsString>) -> Re
 /// Creates a new, empty record directory `<root>/<kind>/<id>` and returns its absolute path.
 /// The id starts with the UTC time, so ids sort by time. The directory is created with an
 /// exclusive create, so two processes never get the same one and no record is ever reused.
-pub fn allocate(root: &Path, kind: Kind) -> Result<PathBuf> {
-    let stamp = format!("{}-{}", utc_stamp(SystemTime::now()), std::process::id());
+///
+/// `label` follows the time in the id; characters other than ASCII letters, digits, `-` and
+/// `_` are replaced with `_`.
+pub fn allocate(root: &Path, kind: Kind, label: &str) -> Result<PathBuf> {
+    let label: String = label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let stamp = format!("{}-{label}", utc_stamp(SystemTime::now()));
     allocate_with(root, kind, &stamp)
 }
 
@@ -176,7 +189,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..50 {
-            let dir = allocate(temp.path(), Kind::Capture).unwrap();
+            let dir = allocate(temp.path(), Kind::Capture, "toolu/1").unwrap();
+            assert!(
+                dir.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .ends_with("-toolu_1")
+            );
             assert!(dir.is_dir() && dir.is_absolute());
             assert!(seen.insert(dir));
         }

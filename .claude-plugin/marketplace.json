@@ -1,0 +1,14 @@
+{
+  "name": "agentgrasp",
+  "owner": {
+    "name": "Darius Mejeras"
+  },
+  "description": "Keeps long Bash output out of Claude Code's context, and answers questions about files with Jev",
+  "plugins": [
+    {
+      "name": "agentgrasp",
+      "source": "./plugin",
+      "description": "Saves long Bash output to files and shows a summary; adds the ask and search MCP tools"
+    }
+  ]
+}

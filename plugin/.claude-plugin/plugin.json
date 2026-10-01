@@ -1,0 +1,10 @@
+{
+  "name": "agentgrasp",
+  "description": "Saves long Bash output to files and shows a summary; adds the ask and search MCP tools",
+  "version": "0.1.0",
+  "author": {
+    "name": "Darius Mejeras"
+  },
+  "repository": "https://github.com/damejeras/agentgrasp",
+  "license": "MIT"
+}

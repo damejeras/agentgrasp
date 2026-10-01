@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "agentgrasp": {
+      "command": "agentgrasp",
+      "args": ["mcp"]
+    }
+  }
+}

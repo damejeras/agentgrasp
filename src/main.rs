@@ -1,6 +1,8 @@
+use std::io::Read;
+use std::path::Path;
 use std::process::ExitCode;
 
-use agentgrasp::{jev, mcp, state};
+use agentgrasp::{capture, jev, mcp, state};
 
 const USAGE: &str = "usage: agentgrasp hook | agentgrasp finish <dir> <status> | agentgrasp mcp";
 
@@ -8,9 +10,10 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("mcp") if args.len() == 1 => run_mcp(),
-        Some("hook") | Some("finish") => {
-            eprintln!("agentgrasp: {} is not built yet", args[0]);
-            ExitCode::FAILURE
+        Some("hook") if args.len() == 1 => run_hook(),
+        Some("finish") if args.len() == 3 => {
+            print!("{}", capture::finish(Path::new(&args[1]), &args[2]));
+            ExitCode::SUCCESS
         }
         _ => {
             eprintln!("{USAGE}");
@@ -42,4 +45,26 @@ fn run_mcp() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// A hook never fails the tool call: on any problem it writes the reason to stderr, prints
+/// nothing and exits 0, and the call goes on unchanged.
+fn run_hook() -> ExitCode {
+    let result = (|| {
+        let mut input = Vec::new();
+        std::io::stdin().read_to_end(&mut input)?;
+        let env = capture::Env {
+            state_root: state::root()?,
+            binary: std::fs::canonicalize(std::env::current_exe()?)?,
+            claude_code_shell: std::env::var("CLAUDE_CODE_SHELL").ok(),
+            shell: std::env::var("SHELL").ok(),
+        };
+        capture::hook(&input, &env)
+    })();
+    match result {
+        Ok(Some(output)) => println!("{output}"),
+        Ok(None) => {}
+        Err(error) => eprintln!("agentgrasp hook: {error:#}"),
+    }
+    ExitCode::SUCCESS
 }

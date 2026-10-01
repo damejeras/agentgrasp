@@ -1,6 +1,6 @@
 [package]
 name = "agentgrasp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "Keeps long command output out of a coding agent's context, and answers yes/no questions about files with Jev"

@@ -1,5 +1,6 @@
 pub mod jev;
 pub mod mcp;
+pub mod search;
 pub mod state;
 
 /// The SHA-256 of `bytes` as lowercase hex.

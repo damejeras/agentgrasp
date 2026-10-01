@@ -5,12 +5,6 @@
         "matcher": "Bash",
         "hooks": [{ "type": "command", "command": "agentgrasp hook" }]
       }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [{ "type": "command", "command": "agentgrasp hook" }]
-      }
     ]
   }
 }

@@ -37,49 +37,20 @@ fn project() -> Project {
     }
 }
 
-/// The allow rules the README gives, plus `extra`.
-fn settings(extra: Value) -> Value {
-    let mut settings = json!({
-        "permissions": {
-            "allow": [
-                "Bash(seq:*)",
-                "Bash(unset TYPESAFE_API_KEY)",
-                format!("Bash({} finish:*)", binary().display()),
-            ],
-        },
-    });
-    let object = settings.as_object_mut().unwrap();
-    for (key, value) in extra.as_object().unwrap() {
-        match (object.get_mut(key), value) {
-            (Some(Value::Object(old)), Value::Object(new)) => {
-                for (k, v) in new {
-                    match (old.get_mut(k), v) {
-                        (Some(Value::Array(a)), Value::Array(b)) => a.extend(b.clone()),
-                        _ => {
-                            old.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-            }
-            _ => {
-                object.insert(key.clone(), value.clone());
-            }
-        }
-    }
-    settings
-}
+const DEFAULT: &str = "default";
+const BYPASS: &str = "bypassPermissions";
 
-fn claude(project: &Project, settings: &Value, command: &str) -> Run {
-    let prompt = format!(
+fn bash_prompt(command: &str) -> String {
+    format!(
         "Call the Bash tool exactly once with this exact command and nothing else, then reply DONE: {command}"
-    );
-    claude_with(project, settings, &prompt, &[], &[])
+    )
 }
 
-/// Runs Claude Code on `prompt` with extra arguments and environment variables.
-fn claude_with(
+/// Runs Claude Code on `prompt` in permission `mode`, with extra arguments and environment.
+fn claude(
     project: &Project,
     settings: &Value,
+    mode: &str,
     prompt: &str,
     args: &[&str],
     envs: &[(&str, &str)],
@@ -92,9 +63,9 @@ fn claude_with(
         binary().parent().unwrap().display(),
         std::env::var("PATH").unwrap()
     );
-    let mut command = Command::new("claude");
-    command.args(args).envs(envs.iter().copied());
-    let output = command
+    let output = Command::new("claude")
+        .args(args)
+        .envs(envs.iter().copied())
         .args(["-p", "--setting-sources", "", "--settings"])
         .arg(&settings_path)
         .arg("--plugin-dir")
@@ -102,9 +73,11 @@ fn claude_with(
         .args([
             "--strict-mcp-config",
             "--permission-mode",
-            "default",
+            mode,
             "--model",
             "haiku",
+        ])
+        .args([
             "--output-format",
             "stream-json",
             "--verbose",
@@ -146,27 +119,32 @@ fn claude_with(
     run
 }
 
-#[test]
-#[ignore = "runs the real Claude Code"]
-fn an_allowed_command_runs_without_a_prompt_and_long_output_is_summarized() {
-    let project = project();
-    let run = claude(&project, &settings(json!({})), "seq 1 2000");
-    assert!(run.denials.is_empty(), "{:?}", run.denials);
-    let (text, is_error) = &run.results[0];
-    assert!(!is_error);
-    assert!(text.starts_with("exit_code: 0\noutput: "), "{text}");
-    assert!(text.contains("output not shown"));
-    assert!(!text.contains("1999"));
+fn bash(project: &Project, settings: &Value, mode: &str, command: &str) -> Run {
+    claude(project, settings, mode, &bash_prompt(command), &[], &[])
+}
+
+fn only_capture(project: &Project) -> PathBuf {
+    let captures = project.state.join("agentgrasp/captures");
+    std::fs::read_dir(captures)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
 }
 
 #[test]
 #[ignore = "runs the real Claude Code"]
-fn short_output_is_shown_with_the_summary() {
+fn in_default_mode_a_wrapped_command_asks_for_approval_even_when_allowed() {
     let project = project();
-    let run = claude(&project, &settings(json!({})), "seq 1 3");
-    assert!(run.denials.is_empty());
+    let settings = json!({"permissions": {"allow": ["Bash(seq:*)"]}});
+    let run = bash(&project, &settings, DEFAULT, "seq 1 3");
     assert!(
-        run.results[0].0.starts_with("1\n2\n3\nexit_code: 0\n"),
+        !run.denials.is_empty(),
+        "Claude Code asks about every brace group"
+    );
+    assert!(
+        run.results[0].0.contains("compound_statement"),
         "{}",
         run.results[0].0
     );
@@ -175,53 +153,56 @@ fn short_output_is_shown_with_the_summary() {
 #[test]
 #[ignore = "runs the real Claude Code"]
 fn a_deny_rule_still_blocks_the_rewritten_command() {
-    let project = project();
-    let settings = settings(json!({"permissions": {"deny": ["Bash(touch:*)"]}}));
-    let run = claude(&project, &settings, "touch marker.txt");
-    assert!(!run.denials.is_empty(), "the call is denied");
-    assert!(
-        run.results[0].0.contains("has been denied"),
-        "{}",
-        run.results[0].0
-    );
-    assert!(!project.dir.join("marker.txt").exists());
+    for mode in [DEFAULT, BYPASS] {
+        let project = project();
+        let settings = json!({"permissions": {"deny": ["Bash(touch:*)"]}});
+        let run = bash(&project, &settings, mode, "touch marker.txt");
+        assert!(!run.denials.is_empty(), "{mode}: the call is denied");
+        assert!(
+            run.results[0].0.contains("has been denied"),
+            "{mode}: {}",
+            run.results[0].0
+        );
+        assert!(!project.dir.join("marker.txt").exists());
+    }
 }
 
 #[test]
 #[ignore = "runs the real Claude Code"]
-fn the_hook_does_not_approve_a_command_the_rules_do_not_allow() {
+fn in_bypass_mode_output_is_captured_and_summarized() {
     let project = project();
-    let run = claude(&project, &settings(json!({})), "touch marker.txt");
-    assert!(!run.denials.is_empty(), "the call still needs approval");
-    assert!(!project.dir.join("marker.txt").exists());
+    let run = bash(&project, &json!({}), BYPASS, "seq 1 3");
+    assert!(run.denials.is_empty(), "{:?}", run.denials);
+    let (text, is_error) = &run.results[0];
+    assert!(!is_error);
+    let dir = only_capture(&project);
+    let expected = format!("agentgrasp: {}\n1\n2\n3\nexit_code: 0\n", dir.display());
+    assert!(text.starts_with(&expected), "{text}");
+
+    let project = self::project();
+    let run = bash(&project, &json!({}), BYPASS, "seq 1 2000");
+    let (text, _) = &run.results[0];
+    assert!(text.contains("output not shown"), "{text}");
+    assert!(!text.contains("1999"));
 }
 
 #[test]
 #[ignore = "runs the real Claude Code"]
 fn the_sandbox_with_the_readme_setting_captures_a_failing_command() {
     let project = project();
-    let sandbox =
+    let settings =
         json!({"sandbox": {"enabled": true, "filesystem": {"allowWrite": [project.state]}}});
-    let run = claude(&project, &settings(sandbox), "seq 1 2000; false");
+    let run = bash(&project, &settings, BYPASS, "seq 1 2000; false");
     assert!(run.denials.is_empty(), "{:?}", run.denials);
     let (text, is_error) = &run.results[0];
-    assert!(
-        !is_error,
-        "the call ends 0, so PostToolUse replaces the output"
-    );
-    assert!(text.starts_with("exit_code: 1\n"), "{text}");
-    let captures = project.state.join("agentgrasp/captures");
-    let dir = std::fs::read_dir(captures)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    assert!(is_error, "Claude Code reports the failure");
+    assert!(text.contains("exit_code: 1\n"), "{text}");
+    let dir = only_capture(&project);
     let metadata: Value =
         serde_json::from_slice(&std::fs::read(dir.join("metadata.json")).unwrap()).unwrap();
     assert_eq!(metadata["exit_code"], 1);
     assert_eq!(
-        std::fs::read_to_string(dir.join("output.log"))
+        std::fs::read_to_string(dir.join("stdout.log"))
             .unwrap()
             .lines()
             .count(),
@@ -233,30 +214,45 @@ fn the_sandbox_with_the_readme_setting_captures_a_failing_command() {
 #[ignore = "runs the real Claude Code"]
 fn claude_code_shell_picks_the_shell_that_is_checked() {
     let project = project();
-    let bash = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+    let bash_path = std::env::split_paths(&std::env::var_os("PATH").unwrap())
         .map(|d| d.join("bash"))
         .find(|p| p.is_file())
-        .expect("bash on PATH");
-    let bash = bash.to_string_lossy().into_owned();
-    let prompt = "Call the Bash tool exactly once with this exact command and nothing else, then reply DONE: seq 1 3";
-    let run = claude_with(
+        .expect("bash on PATH")
+        .to_string_lossy()
+        .into_owned();
+    // /bin/sh is not a shell the hook supports, so without the override the call is not
+    // rewritten; with CLAUDE_CODE_SHELL naming bash, it is.
+    let plain = claude(
         &project,
-        &settings(json!({})),
-        prompt,
+        &json!({}),
+        BYPASS,
+        &bash_prompt("seq 1 3"),
         &[],
-        &[("CLAUDE_CODE_SHELL", &bash), ("SHELL", "/bin/sh")],
+        &[("SHELL", "/bin/sh")],
+    );
+    assert!(
+        !plain.results[0].0.starts_with("agentgrasp: "),
+        "{}",
+        plain.results[0].0
+    );
+    let envs = [
+        ("CLAUDE_CODE_SHELL", bash_path.as_str()),
+        ("SHELL", "/bin/sh"),
+    ];
+    let run = claude(
+        &project,
+        &json!({}),
+        BYPASS,
+        &bash_prompt("seq 1 3"),
+        &[],
+        &envs,
     );
     assert!(run.denials.is_empty(), "{:?}", run.denials);
-    let captures = project.state.join("agentgrasp/captures");
-    let dir = std::fs::read_dir(captures)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let metadata: Value =
-        serde_json::from_slice(&std::fs::read(dir.join("metadata.json")).unwrap()).unwrap();
-    assert_eq!(metadata["shell"], bash);
+    assert!(
+        run.results[0].0.starts_with("agentgrasp: "),
+        "{}",
+        run.results[0].0
+    );
 }
 
 #[test]
@@ -268,14 +264,10 @@ fn an_added_directory_is_an_mcp_root() {
     std::fs::write(added.join("notes.txt"), "notes").unwrap();
     let outside = project.dir.parent().unwrap().join("outside.txt");
     std::fs::write(&outside, "outside").unwrap();
-    let mut allowed = settings(json!({}));
-    allowed["permissions"]["allow"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!("mcp__agentgrasp__ask"));
     // --strict-mcp-config leaves out plugin servers, so the server is given here.
     let servers =
         json!({"mcpServers": {"agentgrasp": {"command": binary(), "args": ["mcp"]}}}).to_string();
+    let settings = json!({"permissions": {"allow": ["mcp__agentgrasp__ask"]}});
     let prompt = format!(
         "Call the agentgrasp ask MCP tool twice, then reply DONE. First with paths [\"{}\"] and questions [\"Is it text?\"]. Then with paths [\"{}\"] and questions [\"Is it text?\"].",
         added.join("notes.txt").display(),
@@ -283,11 +275,18 @@ fn an_added_directory_is_an_mcp_root() {
     );
     let added_arg = added.to_string_lossy().into_owned();
     // Without a key, an allowed path gives provider_unavailable and a refused one invalid_input.
-    let run = claude_with(
+    let args = [
+        "--add-dir",
+        added_arg.as_str(),
+        "--mcp-config",
+        servers.as_str(),
+    ];
+    let run = claude(
         &project,
-        &allowed,
+        &settings,
+        DEFAULT,
         &prompt,
-        &["--add-dir", &added_arg, "--mcp-config", &servers],
+        &args,
         &[("TYPESAFE_API_KEY", "")],
     );
     let texts: Vec<&String> = run

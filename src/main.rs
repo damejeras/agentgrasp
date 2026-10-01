@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -12,8 +12,9 @@ fn main() -> ExitCode {
         Some("mcp") if args.len() == 1 => run_mcp(),
         Some("hook") if args.len() == 1 => run_hook(),
         Some("finish") if args.len() == 3 => {
-            print!("{}", capture::finish(Path::new(&args[1]), &args[2]));
-            ExitCode::SUCCESS
+            let (shown, code) = capture::finish(Path::new(&args[1]), &args[2]);
+            let _ = std::io::stdout().write_all(&shown);
+            ExitCode::from(code as u8)
         }
         _ => {
             eprintln!("{USAGE}");
@@ -47,8 +48,8 @@ fn run_mcp() -> ExitCode {
     }
 }
 
-/// A hook never fails the tool call: on any problem it writes the reason to stderr, prints
-/// nothing and exits 0, and the call goes on unchanged.
+/// The hook never fails the tool call: on any problem it writes the reason to stderr, prints
+/// nothing and exits 0, and the call runs unchanged.
 fn run_hook() -> ExitCode {
     let result = (|| {
         let mut input = Vec::new();

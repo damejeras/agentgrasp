@@ -5,6 +5,7 @@ edition = "2024"
 license = "MIT"
 description = "Keeps long command output out of a coding agent's context, and answers yes/no questions about files with Jev"
 repository = "https://github.com/damejeras/agentgrasp"
+homepage = "https://github.com/damejeras/agentgrasp"
 readme = "README.md"
 keywords = ["mcp", "claude", "hook", "agent", "search"]
 categories = ["command-line-utilities", "development-tools"]

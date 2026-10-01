@@ -16,6 +16,9 @@ claude plugin marketplace add damejeras/agentgrasp
 claude plugin install agentgrasp@agentgrasp
 ```
 
+Instead of the installer, `npm install -g agentgrasp` installs the same binary, and
+`npx agentgrasp mcp` runs the MCP server without a global install.
+
 The plugin calls `agentgrasp` from `PATH`. Set `TYPESAFE_API_KEY` in the environment that
 starts Claude Code; without it, `ask` and `search` return `provider_unavailable`.
 

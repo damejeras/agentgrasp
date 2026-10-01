@@ -348,6 +348,11 @@ fn report(
         "requests_per_minute": evaluator::REQUESTS_PER_MINUTE,
         "request_timeout_seconds": jev::REQUEST_TIMEOUT.as_secs(),
         "ranges_shown": RANGES_SHOWN,
+        "max_evidence_bytes": retrieve::MAX_EVIDENCE_BYTES,
+        "max_anchor_bytes": retrieve::MAX_ANCHOR_BYTES,
+        "sample_bytes": retrieve::SAMPLE_BYTES,
+        "min_sample_chars": retrieve::MIN_SAMPLE_CHARS,
+        "sampled_preview_bytes": retrieve::SAMPLED_PREVIEW_BYTES,
         "selection": {
             "source_unit_bytes": selection::SOURCE_UNIT_BYTES,
             "fallback_unit_bytes": selection::FALLBACK_UNIT_BYTES,

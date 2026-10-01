@@ -17,8 +17,8 @@ use super::evaluator::{EvalError, Evaluator};
 use super::fs::{self, Entry, FileRead, Filesystem, Snapshot};
 use super::preview;
 use super::requests::{
-    ChildEntry, Declaration, DirectoryPreview, Evidence, FilePreview, Kind, NavigationItem,
-    RelationAnchor, navigation_request,
+    ChildEntry, ContentSample, Declaration, DirectoryPreview, Evidence, FilePreview, Kind,
+    NavigationItem, RelationAnchor, navigation_request,
 };
 use super::selection::{Selection, select_file};
 use super::source;
@@ -44,6 +44,15 @@ pub const DIRECTORY_ENTRIES: usize = 64;
 pub const DIRECTORY_ENTRY_BYTES: usize = 4096;
 /// A probability above this qualifies.
 pub const THRESHOLD: f64 = 0.5;
+/// The most selected evidence a contextual pass sends, in JSON bytes.
+pub const MAX_EVIDENCE_BYTES: usize = 64_000;
+/// The class names of a relation anchor, in JSON bytes, must be fewer than this.
+pub const MAX_ANCHOR_BYTES: usize = 4_000;
+/// Content samples of a directory: their share of characters, the least one sample keeps,
+/// and the JSON bound of the sampled preview.
+pub const SAMPLE_BYTES: usize = 16_000;
+pub const MIN_SAMPLE_CHARS: usize = 80;
+pub const SAMPLED_PREVIEW_BYTES: usize = 28_000;
 
 /// A failure, counted by kind and code.
 #[derive(Clone, Debug, Serialize)]
@@ -512,12 +521,16 @@ impl Context {
                             let Some(child_preview) = self.preview_directory(&path) else {
                                 continue;
                             };
-                            items.push(NavigationItem {
+                            let item = NavigationItem {
                                 path,
                                 kind: Kind::Directory,
                                 source_range: None,
                                 file_preview: None,
                                 child_preview: Some(child_preview),
+                            };
+                            items.push(match anchor {
+                                Some(_) => self.with_directory_content(item),
+                                None => item,
                             });
                         }
                         Entry::File { path, .. } => {
@@ -637,17 +650,171 @@ impl Context {
     /// Runs the search policy.
     pub async fn run(self: &Arc<Self>) -> Found {
         self.discover(vec![String::new()], None).await;
-        let selections = self.select(None, HashMap::new()).await;
+        if let Some(anchor) = self.anchor().filter(|_| !self.stopped()) {
+            // One relationship reconsideration of the pruned directories, anchored on the
+            // classes of the best candidate, before new candidates are admitted.
+            let pruned = self.state.lock().unwrap().pruned.clone();
+            let items: Vec<NavigationItem> = pruned
+                .into_iter()
+                .map(|item| self.with_directory_content(item))
+                .collect();
+            let seeds: Vec<String> = self
+                .score(items, Some(anchor.clone()))
+                .await
+                .into_iter()
+                .filter(|(_, score)| *score > THRESHOLD)
+                .map(|(item, _)| item.path)
+                .collect();
+            self.discover(seeds, Some(anchor)).await;
+        }
+        let first = self.select().await;
+        // Donors follow the order in which selection finished, as in jevgrep.
+        let evidence: Vec<Evidence> = first
+            .iter()
+            .flat_map(|(path, selection)| {
+                selection.excerpts.iter().map(|excerpt| Evidence {
+                    path: path.clone(),
+                    start_line: excerpt.range.start_line,
+                    end_line: excerpt.range.end_line,
+                    source: excerpt.source.clone(),
+                })
+            })
+            .collect();
+        let mut selections: HashMap<String, Selection> = first.into_iter().collect();
+        let bytes = serde_json::to_vec(&evidence)
+            .map(|v| v.len())
+            .unwrap_or(usize::MAX);
+        if !evidence.is_empty() && bytes <= MAX_EVIDENCE_BYTES && !self.stopped() {
+            self.reselect(&evidence, &mut selections).await;
+        }
         self.finish(&selections)
     }
 
+    /// The best candidate that declares classes: their names anchor the relationship pass.
+    fn anchor(&self) -> Option<RelationAnchor> {
+        let mut candidates: Vec<Candidate> = self
+            .state
+            .lock()
+            .unwrap()
+            .candidates
+            .values()
+            .cloned()
+            .collect();
+        candidates.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        for candidate in candidates {
+            if candidate.score <= THRESHOLD || self.stopped() {
+                break;
+            }
+            let Some(snapshot) = self.snapshot(&candidate.path) else {
+                continue;
+            };
+            let size = snapshot.source.len();
+            let units =
+                source::inspect(&snapshot.path, &snapshot.source, size.max(4), size.max(1)).units;
+            let mut classes: Vec<String> = Vec::new();
+            for unit in units.iter().filter(|u| u.name.ends_with(".context")) {
+                let class = unit.name.split('.').next().unwrap_or("").to_string();
+                if !classes.contains(&class) {
+                    classes.push(class);
+                }
+            }
+            let bytes = serde_json::to_vec(&classes)
+                .map(|v| v.len())
+                .unwrap_or(usize::MAX);
+            if !classes.is_empty() && bytes < MAX_ANCHOR_BYTES {
+                return Some(RelationAnchor {
+                    path: candidate.path,
+                    classes,
+                });
+            }
+        }
+        None
+    }
+
+    /// A directory preview with samples of its files: the opening, middle and end of each,
+    /// for the relationship question.
+    fn with_directory_content(&self, mut item: NavigationItem) -> NavigationItem {
+        let Some(preview) = item.child_preview.as_mut() else {
+            return item;
+        };
+        let names: Vec<String> = preview
+            .entries
+            .iter()
+            .filter(|c| c.kind == "file")
+            .map(|c| c.name.clone())
+            .collect();
+        let per_file = (SAMPLE_BYTES / names.len().max(1)).max(MIN_SAMPLE_CHARS);
+        let mut samples = Vec::new();
+        for name in names {
+            if self.stopped() {
+                break;
+            }
+            let path = if item.path.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{name}", item.path)
+            };
+            let Some(snapshot) = self.snapshot(&path) else {
+                continue;
+            };
+            if snapshot.source.len() > MAX_INSPECTED_BYTES {
+                continue;
+            }
+            let chars: Vec<char> = snapshot.source.chars().collect();
+            let length = chars.len();
+            let part = per_file / 3;
+            let slice = |start: usize| {
+                chars[start.min(length)..(start + part).min(length)]
+                    .iter()
+                    .collect::<String>()
+            };
+            let source = if length <= per_file {
+                snapshot.source.clone()
+            } else {
+                [
+                    0,
+                    (length / 2).saturating_sub(part / 2),
+                    length.saturating_sub(part),
+                ]
+                .iter()
+                .map(|&start| format!("[character offset {start}]\n{}", slice(start)))
+                .collect::<Vec<_>>()
+                .join("\n...\n")
+            };
+            samples.push(ContentSample {
+                name,
+                truncated: length > per_file,
+                source,
+            });
+        }
+        preview.content_samples = Some(samples);
+        let too_big = |p: &DirectoryPreview| {
+            serde_json::to_vec(p).map(|v| v.len()).unwrap_or(usize::MAX) > SAMPLED_PREVIEW_BYTES
+        };
+        while too_big(preview)
+            && preview
+                .content_samples
+                .iter()
+                .flatten()
+                .any(|s| s.source.chars().count() > MIN_SAMPLE_CHARS)
+        {
+            for sample in preview.content_samples.iter_mut().flatten() {
+                let count = sample.source.chars().count();
+                let keep = (count * 4 / 5).max(MIN_SAMPLE_CHARS);
+                sample.source = sample.source.chars().take(keep).collect();
+                sample.truncated = true;
+            }
+        }
+        item
+    }
+
     /// Selects the qualifying regions of every candidate file, up to `CONCURRENCY` files at
-    /// once. With `evidence`, each file is judged again against it, starting from `previous`.
-    async fn select(
-        self: &Arc<Self>,
-        evidence: Option<Arc<Vec<Evidence>>>,
-        mut previous: HashMap<String, Selection>,
-    ) -> HashMap<String, Selection> {
+    /// once, in the order they finish.
+    async fn select(self: &Arc<Self>) -> Vec<(String, Selection)> {
         let candidates: Vec<Candidate> = self
             .state
             .lock()
@@ -656,7 +823,7 @@ impl Context {
             .values()
             .cloned()
             .collect();
-        let mut selections = HashMap::new();
+        let mut selections = Vec::new();
         let mut queue: VecDeque<Candidate> = candidates.into();
         let mut running = JoinSet::new();
         loop {
@@ -664,30 +831,14 @@ impl Context {
                 let Some(candidate) = queue.pop_front() else {
                     break;
                 };
-                let Some(snapshot) = self.snapshot(&candidate.path) else {
+                let Some(snapshot) = self.inspectable(&candidate.path) else {
                     continue;
                 };
-                if snapshot.source.len() > MAX_INSPECTED_BYTES {
-                    self.issue(
-                        "inspection_limit",
-                        Code::InputTooLarge,
-                        "a file is too large to select regions from",
-                        vec![candidate.path.clone()],
-                    );
-                    continue;
-                }
                 let context = self.clone();
-                let evidence = evidence.clone();
-                let prior = previous.remove(&candidate.path);
                 running.spawn(async move {
-                    let selection = select_file(
-                        &context.evaluator,
-                        &context.query,
-                        &snapshot,
-                        evidence.as_ref().map(|e| e.as_slice()),
-                        prior,
-                    )
-                    .await;
+                    let selection =
+                        select_file(&context.evaluator, &context.query, &snapshot, None, None)
+                            .await;
                     (candidate.path, selection)
                 });
             }
@@ -698,11 +849,60 @@ impl Context {
             for failure in &selection.failures {
                 self.eval_issue(failure, vec![path.clone()]);
             }
-            selections.insert(path, selection);
+            selections.push((path, selection));
         }
-        // A file that was not judged again keeps its earlier selection.
-        selections.extend(previous);
         selections
+    }
+
+    /// Judges every candidate again, one file at a time, with the selected evidence of all
+    /// files: a unit that the evidence references can join, and a valid rejection retracts.
+    /// A file that is not judged again keeps its first selection.
+    async fn reselect(&self, evidence: &[Evidence], selections: &mut HashMap<String, Selection>) {
+        let candidates: Vec<Candidate> = self
+            .state
+            .lock()
+            .unwrap()
+            .candidates
+            .values()
+            .cloned()
+            .collect();
+        for candidate in candidates {
+            if self.stopped() {
+                break;
+            }
+            let Some(snapshot) = self.inspectable(&candidate.path) else {
+                continue;
+            };
+            let previous = selections.remove(&candidate.path);
+            let selection = select_file(
+                &self.evaluator,
+                &self.query,
+                &snapshot,
+                Some(evidence),
+                previous,
+            )
+            .await;
+            for failure in &selection.failures {
+                self.eval_issue(failure, vec![candidate.path.clone()]);
+            }
+            selections.insert(candidate.path, selection);
+        }
+    }
+
+    /// The snapshot of a candidate whose regions can be selected; a larger file is an issue
+    /// and stays a file-only match.
+    fn inspectable(&self, path: &str) -> Option<Arc<Snapshot>> {
+        let snapshot = self.snapshot(path)?;
+        if snapshot.source.len() > MAX_INSPECTED_BYTES {
+            self.issue(
+                "inspection_limit",
+                Code::InputTooLarge,
+                "a file is too large to select regions from",
+                vec![path.to_string()],
+            );
+            return None;
+        }
+        Some(snapshot)
     }
 
     fn finish(&self, selections: &HashMap<String, Selection>) -> Found {

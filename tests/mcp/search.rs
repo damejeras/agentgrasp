@@ -23,6 +23,15 @@ pub const TESTS: &[(&str, Test)] = &[
     ("search_keeps_a_file_when_selection_fails", || {
         Box::pin(search_keeps_a_file_when_selection_fails())
     }),
+    ("search_contextual_pass_adds_and_retracts", || {
+        Box::pin(search_contextual_pass_adds_and_retracts())
+    }),
+    ("search_failed_contextual_pass_keeps_ranges", || {
+        Box::pin(search_failed_contextual_pass_keeps_ranges())
+    }),
+    ("search_rediscovers_related_directories", || {
+        Box::pin(search_rediscovers_related_directories())
+    }),
     ("search_invalid_input", || Box::pin(search_invalid_input())),
     ("search_missing_key_fails_at_start", || {
         Box::pin(search_missing_key_fails_at_start())
@@ -195,6 +204,8 @@ async fn search_ranks_files_and_reports() {
     assert_eq!(selection["whole_source_bytes"], 16_000);
     assert_eq!(selection["context_lines"], 8);
     assert_eq!(selection["opening_lines"], 20);
+    assert_eq!(report["constants"]["max_evidence_bytes"], 64_000);
+    assert_eq!(report["constants"]["sampled_preview_bytes"], 28_000);
     let stdout = client.stdout.join("\n");
     let stderr = client.close().await;
     assert!(!stdout.contains(MARKER) && !stderr.contains(MARKER));
@@ -333,6 +344,198 @@ async fn search_keeps_a_file_when_selection_fails() {
         "the files stay matches without ranges"
     );
     assert_eq!(output["matches"][0]["ranges"], json!([]));
+}
+
+/// Answers evidence requests per declaration name, with a different rule once selected
+/// evidence is present.
+fn contextual(
+    request: &Value,
+    first: impl Fn(&str) -> f64,
+    second: impl Fn(&str, &str) -> f64,
+) -> Reply {
+    let declarations = request["state"]["declarations"].as_array().unwrap();
+    let with_evidence = request["state"].get("selectedEvidence").is_some();
+    let answers: serde_json::Map<String, Value> = request["questions"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|key| {
+            let kind = key.trim_end_matches(|c: char| c.is_ascii_digit());
+            let index: usize = key[kind.len()..].parse().unwrap();
+            let name = declarations[index]["name"].as_str().unwrap();
+            let p = if with_evidence {
+                second(name, kind)
+            } else if kind == "ref" {
+                0.0
+            } else {
+                first(name)
+            };
+            (key.clone(), json!({"type": "noul", "noul": p}))
+        })
+        .collect();
+    Reply::status(200, json!({"model": "jev-ctx", "answers": answers, "usage": {"input_tokens": 3, "output_tokens": 1}}).to_string())
+}
+
+fn ledger(world: &World) {
+    world.file(
+        "src/payments/refunds.go",
+        "package payments\n\nfunc Refund() {\n\tHelper()\n}\n\nfunc Helper() {}\n\nfunc Stale() {}\n",
+    );
+}
+
+fn first_pass(name: &str) -> f64 {
+    if matches!(name, "Refund" | "Stale") {
+        0.9
+    } else {
+        0.1
+    }
+}
+
+async fn search_contextual_pass_adds_and_retracts() {
+    let world = World::new();
+    ledger(&world);
+    let jev = FakeJev::start(|_, request| {
+        if request["state"]["declarations"].is_array() {
+            contextual(request, first_pass, |name, kind| match (name, kind) {
+                ("Refund", "q" | "scope") => 0.9,
+                ("Helper", "ref") => 0.92,
+                _ => 0.1,
+            })
+        } else {
+            navigation(request, payments_score)
+        }
+    })
+    .await;
+    let mut client = world.default_server(&jev).await;
+    let result = client.call("search", search_args(&world, json!({}))).await;
+    let output = structured(&result);
+    assert_eq!(output["status"], "complete", "{output}");
+    assert_eq!(
+        output["matches"][0]["ranges"],
+        json!([
+            {"start_line": 7, "end_line": 7, "relevance": 0.92},
+            {"start_line": 3, "end_line": 5, "relevance": 0.9},
+        ]),
+        "Helper joins through the reference; Stale is retracted"
+    );
+    // The contextual requests carry the first pass's excerpts, with their source.
+    let contextual: Vec<Value> = (0..jev.requests())
+        .map(|i| jev.body(i))
+        .filter(|b| b["state"].get("selectedEvidence").is_some())
+        .collect();
+    assert_eq!(contextual.len(), 1);
+    let evidence = contextual[0]["state"]["selectedEvidence"]
+        .as_array()
+        .unwrap();
+    assert_eq!(evidence[0]["path"], "src/payments/refunds.go");
+    assert!(
+        evidence
+            .iter()
+            .any(|e| e["source"].as_str().unwrap().contains("func Refund()"))
+    );
+    assert!(contextual[0]["questions"].get("ref0").is_some());
+    let report = std::fs::read_to_string(output["report_path"].as_str().unwrap()).unwrap();
+    assert!(!report.contains("func Refund"), "excerpts are never stored");
+}
+
+async fn search_failed_contextual_pass_keeps_ranges() {
+    let world = World::new();
+    ledger(&world);
+    let jev = FakeJev::start(|_, request| {
+        if request["state"].get("selectedEvidence").is_some() {
+            Reply::status(500, "{}")
+        } else if request["state"]["declarations"].is_array() {
+            contextual(request, first_pass, |_, _| 0.0)
+        } else {
+            navigation(request, payments_score)
+        }
+    })
+    .await;
+    let mut client = world.default_server(&jev).await;
+    let result = client.call("search", search_args(&world, json!({}))).await;
+    let output = structured(&result);
+    assert_eq!(output["status"], "incomplete");
+    assert_eq!(output["error"]["code"], "provider_unavailable");
+    let ranges: Vec<u64> = output["matches"][0]["ranges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["start_line"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        ranges,
+        vec![3, 9],
+        "the first pass stays when the contextual pass fails"
+    );
+}
+
+async fn search_rediscovers_related_directories() {
+    let world = World::new();
+    world.file(
+        "src/core/base.py",
+        "class Base:\n    def run(self):\n        return 1\n",
+    );
+    world.file(
+        "ext/plugins/impl.py",
+        "from core.base import Base\n\nclass Impl(Base):\n    def run(self):\n        return 2\n",
+    );
+    let jev = FakeJev::start(|_, request| {
+        if request["state"]["declarations"].is_array() {
+            return contextual(request, |_| 0.1, |_, _| 0.1);
+        }
+        let anchored = request["state"].get("relationAnchor").is_some();
+        navigation(request, move |path| match path {
+            "src/core" | "src/core/base.py" => 0.9,
+            "ext/plugins" if anchored => 0.9,
+            "ext/plugins/impl.py" if anchored => 0.8,
+            _ => 0.1,
+        })
+    })
+    .await;
+    let mut client = world.default_server(&jev).await;
+    let result = client.call("search", search_args(&world, json!({}))).await;
+    let output = structured(&result);
+    let paths: Vec<&str> = output["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["path"].as_str().unwrap())
+        .collect();
+    let root = world.root.to_str().unwrap();
+    assert_eq!(
+        paths,
+        vec![
+            format!("{root}/src/core/base.py"),
+            format!("{root}/ext/plugins/impl.py")
+        ]
+    );
+    let anchored: Vec<Value> = (0..jev.requests())
+        .map(|i| jev.body(i))
+        .filter(|b| b["state"].get("relationAnchor").is_some())
+        .collect();
+    let first = &anchored[0]["state"];
+    assert_eq!(
+        first["relationAnchor"],
+        json!({"path": "src/core/base.py", "classes": ["Base"]})
+    );
+    let samples = &first["items"][0]["childPreview"]["contentSamples"];
+    assert_eq!(samples[0]["name"], "impl.py");
+    assert!(
+        samples[0]["source"]
+            .as_str()
+            .unwrap()
+            .contains("class Impl(Base)")
+    );
+    assert!(
+        anchored[0]["questions"]["q0"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("relationAnchor.classes")
+    );
+    assert_eq!(
+        output["directories_pruned"], 1,
+        "ext/plugins was pruned before the anchor found it"
+    );
 }
 
 async fn search_invalid_input() {

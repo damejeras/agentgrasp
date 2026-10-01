@@ -55,8 +55,19 @@ pub struct Selection {
     pub decisions: BTreeMap<Span, Decision>,
     /// The selected spans, before merging.
     pub selected: Vec<Span>,
+    /// The spans the excerpts cover, which a later pass keeps as context.
+    pub rendered: Vec<Span>,
+    /// The selected source with its surroundings: the evidence that a later pass shows Jev.
+    /// It stays in memory; it is never returned or stored.
+    pub excerpts: Vec<Excerpt>,
     /// Failures, by kind; a provider failure does not stop the file.
     pub failures: Vec<EvalError>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Excerpt {
+    pub range: Range,
+    pub source: String,
 }
 
 impl Selection {
@@ -109,7 +120,8 @@ impl<'a> Lines<'a> {
 /// The units selection judges: declarations, or 3,000-byte fragments when there are none, with
 /// units over 24,000 bytes cut into 16-line blocks. A file with a giant line keeps the
 /// parser's byte-bounded units.
-pub fn units(snapshot: &Snapshot) -> Vec<Unit> {
+/// Also gives the comments, which bound the excerpt windows.
+pub fn units(snapshot: &Snapshot) -> (Vec<Unit>, Vec<Range>) {
     let lines = Lines::new(&snapshot.source);
     let text = &lines.text;
     let giant_line =
@@ -125,6 +137,7 @@ pub fn units(snapshot: &Snapshot) -> Vec<Unit> {
         max_unit,
         source::MAX_PARSE_BYTES,
     );
+    let comments = syntax.comments;
     let mut units = syntax.units;
     if !giant_line && (syntax.mode == source::Mode::Text || units.iter().all(|u| u.partial)) {
         units = source::split_source(&snapshot.source, FALLBACK_UNIT_BYTES)
@@ -139,9 +152,9 @@ pub fn units(snapshot: &Snapshot) -> Vec<Unit> {
             .collect();
     }
     if giant_line {
-        return units;
+        return (units, comments);
     }
-    units
+    let units = units
         .into_iter()
         .flat_map(|unit| {
             if text.lines(unit.range.start_line, unit.range.end_line).len() <= SOURCE_UNIT_BYTES {
@@ -162,7 +175,8 @@ pub fn units(snapshot: &Snapshot) -> Vec<Unit> {
                 })
                 .collect()
         })
-        .collect()
+        .collect();
+    (units, comments)
 }
 
 fn groups(units: Vec<Unit>, text: &Text) -> Vec<Vec<Unit>> {
@@ -248,8 +262,11 @@ pub async fn select_file(
     let lines = Lines::new(&snapshot.source);
     let mut selection = previous.unwrap_or_default();
     selection.failures.clear();
-    let mut queue: std::collections::VecDeque<Vec<Unit>> =
-        groups(units(snapshot), &lines.text).into();
+    let (units, comments) = units(snapshot);
+    // Excerpts cover what this pass selects and what the previous pass showed.
+    let mut context_spans = std::mem::take(&mut selection.rendered);
+    let mut selected_lines: Vec<Range> = Vec::new();
+    let mut queue: std::collections::VecDeque<Vec<Unit>> = groups(units, &lines.text).into();
     while let Some(group) = queue.pop_front() {
         let declarations: Vec<Declaration> = group
             .iter()
@@ -340,10 +357,143 @@ pub async fn select_file(
             }
             if score > THRESHOLD {
                 selection.selected.push(span);
+                context_spans.push(span);
+                if lines.whole_lines(span) {
+                    selected_lines.push(unit.range);
+                }
             }
         }
     }
+    let chosen = merge(&selection.selected);
+    let mut whole_ranges = selected_lines;
+    let mut rendered = Vec::new();
+    for span in merge(&context_spans) {
+        if lines.whole_lines(span) {
+            whole_ranges.push(lines.range_for(span));
+        } else {
+            rendered.push(span);
+        }
+    }
+    let mut ranges = whole_ranges.clone();
+    if (snapshot.path.ends_with(".py") || snapshot.path.ends_with(".pyi"))
+        && snapshot.source.len() <= source::MAX_PARSE_BYTES
+        && !whole_ranges.is_empty()
+    {
+        ranges.extend(source::python_neighborhood(&snapshot.source, &whole_ranges));
+    }
+    let (spans, excerpts) = excerpts(&lines, &ranges, rendered, &comments, &chosen);
+    selection.rendered = spans;
+    selection.excerpts = excerpts;
     selection
+}
+
+/// Sorted, overlapping spans joined; empty spans dropped.
+pub fn merge(spans: &[Span]) -> Vec<Span> {
+    let mut sorted: Vec<Span> = spans.iter().copied().filter(|s| s.end > s.start).collect();
+    sorted.sort();
+    let mut merged: Vec<Span> = Vec::new();
+    for span in sorted {
+        match merged.last_mut() {
+            Some(last) if span.start <= last.end => last.end = last.end.max(span.end),
+            _ => merged.push(span),
+        }
+    }
+    merged
+}
+
+/// Windows of three lines around each range, grown over comments that touch them or are
+/// separated from them only by blank lines. A giant line in a window is shown only where a
+/// selected span covers it. Returns the covered spans and their text.
+fn excerpts(
+    lines: &Lines,
+    ranges: &[Range],
+    mut rendered: Vec<Span>,
+    comments: &[Range],
+    chosen: &[Span],
+) -> (Vec<Span>, Vec<Excerpt>) {
+    let text = &lines.text;
+    let blank =
+        |from: usize, to: usize| (from..=to).all(|line| text.lines(line, line).trim().is_empty());
+    let windows: Vec<Range> = ranges
+        .iter()
+        .map(|r| {
+            Range::new(
+                r.start_line.saturating_sub(3).max(1),
+                text.line_count.min(r.end_line + 3),
+            )
+        })
+        .collect();
+    let mut grown = Vec::new();
+    for mut window in windows.iter().copied() {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for comment in comments {
+                let before = comment.end_line < window.start_line
+                    && blank(comment.end_line + 1, window.start_line - 1);
+                let after = comment.start_line > window.end_line
+                    && blank(window.end_line + 1, comment.start_line - 1);
+                let overlaps =
+                    comment.start_line <= window.end_line && comment.end_line >= window.start_line;
+                if overlaps || before || after {
+                    let start = window.start_line.min(comment.start_line);
+                    let end = window.end_line.max(comment.end_line);
+                    if start != window.start_line || end != window.end_line {
+                        window = Range::new(start, end);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        let mut segment_start = text.line_start(window.start_line);
+        for line in window.start_line..=window.end_line {
+            let (start, end) = (text.line_start(line), text.line_end(line));
+            // An adjacent selected declaration must not pull in an unselected giant line.
+            if end - start > SOURCE_UNIT_BYTES {
+                rendered.push(Span {
+                    start: segment_start,
+                    end: start,
+                });
+                for span in chosen {
+                    if span.start < end && span.end > start {
+                        rendered.push(Span {
+                            start: span.start.max(start),
+                            end: span.end.min(end),
+                        });
+                    }
+                }
+                segment_start = end;
+            }
+        }
+        rendered.push(Span {
+            start: segment_start,
+            end: text.line_end(window.end_line),
+        });
+        grown.push(window);
+    }
+    let spans = merge(&rendered);
+    let excerpts = spans
+        .iter()
+        .map(|&span| {
+            let mut range = lines.range_for(span);
+            if lines.whole_lines(span) {
+                // A trailing empty line has no bytes but belongs to a window that ends there.
+                if span.end == text.len() && grown.iter().any(|w| w.end_line == text.line_count) {
+                    range.end_line = text.line_count;
+                }
+                Excerpt {
+                    range,
+                    source: text.lines(range.start_line, range.end_line).to_string(),
+                }
+            } else {
+                Excerpt {
+                    range,
+                    source: text.source[span.start..span.end].to_string(),
+                }
+            }
+        })
+        .collect();
+    (spans, excerpts)
 }
 
 #[cfg(test)]
@@ -361,11 +511,11 @@ mod tests {
     #[test]
     fn declarations_are_units_and_text_falls_back_to_fragments() {
         let go = snapshot("a.go", "package a\n\nfunc A() {}\n\nfunc B() {}\n");
-        let names: Vec<String> = units(&go).into_iter().map(|u| u.name).collect();
+        let names: Vec<String> = units(&go).0.into_iter().map(|u| u.name).collect();
         assert_eq!(names, vec!["package a", "A", "B"]);
         let text: String = (0..400).map(|i| format!("line {i} of notes\n")).collect();
         let notes = snapshot("notes.md", &text);
-        let fragments = units(&notes);
+        let fragments = units(&notes).0;
         assert!(fragments.len() > 1);
         assert!(
             fragments
@@ -390,7 +540,7 @@ mod tests {
             .map(|i| format!("    x{i} = {i}  # padding padding\n"))
             .collect();
         let py = snapshot("a.py", &format!("def big():\n{body}"));
-        let blocks = units(&py);
+        let blocks = units(&py).0;
         assert!(blocks.len() > 100);
         assert!(
             blocks
@@ -425,15 +575,52 @@ mod tests {
     }
 
     #[test]
+    fn excerpts_take_three_lines_around_and_adjacent_comments() {
+        let source =
+            "l1\nl2\n// about f\n\nfn f() {}\nl6\nl7\nl8\nl9\nl10\nl11\n// trailing\nl13\n";
+        let lines = Lines::new(source);
+        let comments = vec![Range::new(3, 3), Range::new(12, 12)];
+        let (_, out) = excerpts(&lines, &[Range::new(5, 5)], Vec::new(), &comments, &[]);
+        // Lines 2-8; the comment on line 3 is inside; line 12 is beyond a non-blank line.
+        assert_eq!(
+            out,
+            vec![Excerpt {
+                range: Range::new(2, 8),
+                source: "l2\n// about f\n\nfn f() {}\nl6\nl7\nl8".into()
+            }]
+        );
+        let (_, out) = excerpts(&lines, &[Range::new(9, 9)], Vec::new(), &comments, &[]);
+        assert_eq!(
+            out[0].range,
+            Range::new(6, 12),
+            "a comment right after the window joins it"
+        );
+    }
+
+    #[test]
+    fn excerpts_keep_a_giant_line_out_unless_selected() {
+        let giant = "x".repeat(SOURCE_UNIT_BYTES + 10);
+        let source = format!("a\nb\n{giant}\nc\n");
+        let lines = Lines::new(&source);
+        let (spans, out) = excerpts(&lines, &[Range::new(1, 1)], Vec::new(), &[], &[]);
+        assert_eq!(out.len(), 2, "{spans:?}");
+        assert_eq!(out[0].source, "a\nb");
+        assert_eq!(
+            out[1].source, "c",
+            "whole lines, joined as jevgrep joins them"
+        );
+    }
+
+    #[test]
     fn small_files_go_whole_and_large_ones_get_windows() {
         let small = snapshot("a.rs", "fn a() {}\nfn b() {}\n");
-        let units_small = units(&small);
+        let units_small = units(&small).0;
         let lines = Lines::new(&small.source);
         assert_eq!(context(&small, &lines, &units_small), small.source);
         let big_source: String = (0..3000).map(|i| format!("fn f{i}() {{}}\n")).collect();
         let big = snapshot("b.rs", &big_source);
         let lines = Lines::new(&big.source);
-        let group: Vec<Unit> = units(&big).into_iter().skip(1000).take(3).collect();
+        let group: Vec<Unit> = units(&big).0.into_iter().skip(1000).take(3).collect();
         let window = context(&big, &lines, &group);
         assert!(window.starts_with("Opening context:\nfn f0() {}\n"));
         assert!(window.contains("\nSource lines 993-1011:\nfn f992() {}"));

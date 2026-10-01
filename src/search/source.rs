@@ -571,6 +571,76 @@ fn python_declarations(root: Node, source: &str) -> Vec<Declaration> {
     units
 }
 
+/// More context for selected Python methods: the header of their class (at most 40 lines,
+/// up to its first method) and the methods next to them when those are at most 40 lines
+/// long. jevgrep's `neighborhood`. Ranges are added, never removed.
+pub fn python_neighborhood(source: &str, selected: &[Range]) -> Vec<Range> {
+    let Some(tree) = parse_python(source) else {
+        return Vec::new();
+    };
+    let mut extra = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(wrapped) = stack.pop() {
+        stack.extend(named_children(wrapped).into_iter().rev());
+        if wrapped.kind() == "function_definition"
+            && wrapped
+                .parent()
+                .is_some_and(|p| p.kind() == "decorated_definition")
+        {
+            continue;
+        }
+        if definition(wrapped).is_none_or(|n| n.kind() != "function_definition") {
+            continue;
+        }
+        let Some(owner) = wrapped.parent().and_then(|block| block.parent()) else {
+            continue;
+        };
+        if owner.kind() != "class_definition" {
+            continue;
+        }
+        let r = python_range(wrapped);
+        if !selected
+            .iter()
+            .any(|s| s.start_line <= r.end_line && s.end_line >= r.start_line)
+        {
+            continue;
+        }
+        let siblings: Vec<Node> = body(owner)
+            .into_iter()
+            .filter(|n| is_definition(*n))
+            .collect();
+        let owner_wrapper = owner
+            .parent()
+            .filter(|p| p.kind() == "decorated_definition")
+            .unwrap_or(owner);
+        let start = python_start_line(owner_wrapper);
+        let end = siblings
+            .iter()
+            .map(|s| python_start_line(*s).saturating_sub(1))
+            .chain(std::iter::once(start + 39))
+            .min()
+            .unwrap_or(start + 39);
+        if start <= end {
+            extra.push(Range::new(start, end));
+        }
+        let index = siblings
+            .iter()
+            .position(|s| s.id() == wrapped.id())
+            .unwrap_or(0);
+        for sibling in siblings
+            .iter()
+            .skip(index.saturating_sub(1))
+            .take(if index == 0 { 2 } else { 3 })
+        {
+            let rr = python_range(*sibling);
+            if sibling.id() != wrapped.id() && rr.end_line + 1 - rr.start_line <= 40 {
+                extra.push(rr);
+            }
+        }
+    }
+    extra
+}
+
 /// Tree-sitter accepts some Python 2 syntax. Those forms are rejected; modern Python is
 /// accepted. This is structural recognition, not compile validation.
 fn valid_python(root: Node, source: &str) -> bool {
@@ -1016,6 +1086,21 @@ mod tests {
                     .all(|u| u.name == "source" && u.partial)
             );
         }
+    }
+
+    #[test]
+    fn python_neighborhood_adds_the_class_header_and_short_neighbours() {
+        let source = "class Pay:\n    limit = 3\n\n    def a(self):\n        pass\n\n    def b(self):\n        pass\n\n    def c(self):\n        pass\n\n    def d(self):\n        pass\n";
+        let extra = python_neighborhood(source, &[Range::new(7, 8)]);
+        assert_eq!(
+            extra,
+            vec![Range::new(1, 3), Range::new(4, 5), Range::new(10, 11)]
+        );
+        assert!(
+            python_neighborhood(source, &[Range::new(1, 2)]).is_empty(),
+            "not a method"
+        );
+        assert!(python_neighborhood("print 'x'\n", &[Range::new(1, 1)]).is_empty());
     }
 
     #[test]
